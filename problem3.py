@@ -17,7 +17,7 @@ def rearrange_by_frequency(nums: list[int]) -> list[int]:
     result = []
     for x in takrorlanmas_raqamlar:
         soni = counts[x]
-        result.extend([x] * soni) # [x, x, x] ko'rinishida qo'shadi
+        result.extend([x] * soni)
         
     return result
 
