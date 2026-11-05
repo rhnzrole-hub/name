@@ -5,6 +5,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +28,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Install Android tools
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+        run: /usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - name: Fetch source and apply changes
         run: |
           git clone --no-checkout https://github.com/DrKLO/Telegram.git source
