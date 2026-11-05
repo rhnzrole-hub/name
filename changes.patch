@@ -1,0 +1,122 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java
+index c7dd6d0ef..ec19beb1b 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java
+@@ -2987,8 +2987,9 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
+             return;
+         }
+ 
+-        boolean last = traversePlaylist(currentPlayList, SharedConfig.playOrderReversed ? +1 : -1);
+-        if (last && byStop && SharedConfig.repeatMode == 0 && !forceLoopCurrentPlaylist) {
++        boolean stopAfterCurrent = byStop && SharedConfig.repeatMode == 3 && playingMessageObject != null && playingMessageObject.isMusic();
++        boolean last = stopAfterCurrent || traversePlaylist(currentPlayList, SharedConfig.playOrderReversed ? +1 : -1);
++        if (last && byStop && (stopAfterCurrent || SharedConfig.repeatMode == 0 && !forceLoopCurrentPlaylist)) {
+             if (audioPlayer != null || videoPlayer != null) {
+                 if (audioPlayer != null) {
+                     if (reporter != null) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+index 91faf802c..4977840a3 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+@@ -21667,6 +21667,10 @@ public class MessagesController extends BaseController implements NotificationCe
+     }
+ 
+     public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {
++        // Do not request or display sponsored posts in channels.
++        if (dialogId < 0 && ChatObject.isChannel(getChat(-dialogId))) {
++            return null;
++        }
+         SponsoredMessagesInfo info = sponsoredMessages.get(dialogId);
+         if (info != null && (info.loading || Math.abs(SystemClock.elapsedRealtime() - info.loadTime) <= 5 * 60 * 1000)) {
+             return info;
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
+index 7efb06c5e..70369d738 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
+@@ -1181,7 +1181,7 @@ public class SharedConfig {
+ 
+     public static void setRepeatMode(int mode) {
+         repeatMode = mode;
+-        if (repeatMode < 0 || repeatMode > 2) {
++        if (repeatMode < 0 || repeatMode > 3) {
+             repeatMode = 0;
+         }
+         SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java
+index 88fe6a168..56a9e19a8 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java
+@@ -172,6 +172,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+     private ActionBarMenuSubItem repeatSongItem;
+     private ActionBarMenuSubItem repeatListItem;
+     private ActionBarMenuSubItem shuffleListItem;
++    private ActionBarMenuSubItem stopAfterSongItem;
+     private ActionBarMenuSubItem reverseOrderItem;
+     private ImageView playButton;
+     private PlayPauseDrawable playPauseDrawable;
+@@ -767,7 +768,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+         buttons[0] = repeatButton = new ActionBarMenuItem(context, null, 0, 0, false, resourcesProvider);
+         repeatButton.setLongClickEnabled(false);
+         repeatButton.setShowSubmenuByMove(false);
+-        repeatButton.setAdditionalYOffset(-dp(166));
++        repeatButton.setAdditionalYOffset(-dp(214));
+         repeatButton.setBackgroundDrawable(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 1, dp(18)));
+         bottomView.addView(repeatButton, LayoutHelper.createFrame(48, 48, Gravity.LEFT | Gravity.TOP));
+         repeatButton.setOnClickListener(v -> {
+@@ -776,6 +777,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+         });
+         repeatSongItem = repeatButton.addSubItem(3, R.drawable.player_new_repeatone, LocaleController.getString(R.string.RepeatSong));
+         repeatListItem = repeatButton.addSubItem(4, R.drawable.player_new_repeatall, LocaleController.getString(R.string.RepeatList));
++        stopAfterSongItem = repeatButton.addSubItem(5, R.drawable.player_new_repeat_off, LocaleController.getString(R.string.StopAfterSong));
+         repeatButton.addColoredGap().getLayoutParams().height = dp(4);
+         shuffleListItem = repeatButton.addSubItem(2, R.drawable.player_new_shuffle, LocaleController.getString(R.string.ShuffleList));
+         repeatButton.addColoredGap().getLayoutParams().height = dp(4);
+@@ -795,6 +797,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+                     listView.stopScroll();
+                     scrollToCurrentSong(false);
+                 }
++            } else if (id == 5) {
++                SharedConfig.setRepeatMode(SharedConfig.repeatMode == 3 ? 0 : 3);
+             } else {
+                 if (id == 4) {
+                     if (SharedConfig.repeatMode == 1) {
+@@ -1637,6 +1641,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+         setMenuItemChecked(reverseOrderItem, SharedConfig.playOrderReversed);
+         setMenuItemChecked(repeatListItem, SharedConfig.repeatMode == 1);
+         setMenuItemChecked(repeatSongItem, SharedConfig.repeatMode == 2);
++        setMenuItemChecked(stopAfterSongItem, SharedConfig.repeatMode == 3);
+     }
+ 
+     private boolean equals(float a, float b) {
+@@ -2149,6 +2154,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+                     repeatButton.setContentDescription(LocaleController.getString(R.string.AccDescrRepeatList));
+                 }
+             }
++        } else if (mode == 3) {
++            repeatButton.setIcon(R.drawable.player_new_repeat_off);
++            repeatButton.setTag(Theme.key_player_buttonActive);
++            repeatButton.setIconColor(getThemedColor(Theme.key_player_buttonActive));
++            Theme.setSelectorDrawableColor(repeatButton.getBackground(), getThemedColor(Theme.key_player_buttonActive) & 0x19ffffff, true);
++            repeatButton.setContentDescription(LocaleController.getString(R.string.StopAfterSong));
+         } else if (mode == 2) {
+             repeatButton.setIcon(R.drawable.player_new_repeatone);
+             repeatButton.setTag(Theme.key_player_buttonActive);
+@@ -3610,4 +3621,4 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
+         });
+         rightPaddingAnimator.start();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index db9de7556..94fe768dd 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -1159,6 +1159,7 @@
+     <string name="AudioUnknownArtist">Unknown artist</string>
+     <string name="AudioUnknownTitle">Unknown title</string>
+     <string name="RepeatSong">Repeat song</string>
++    <string name="StopAfterSong">Stop after current audio</string>
+     <string name="RepeatList">Repeat list</string>
+     <string name="ShuffleList">Shuffle list</string>
+     <string name="ReverseOrder">Reverse order</string>
