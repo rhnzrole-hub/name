@@ -87,7 +87,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: telegram-plus-13.2.1-apk
+          name: telegram-plus-13.2.1-10accounts-apk
           path: source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk
           if-no-files-found: error
       - name: Remove signing material
