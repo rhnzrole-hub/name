@@ -1,7 +1,29 @@
-# Unofficial Telegram Android build
+# Telegram Plus — unofficial Android build
 
-This repository stores a patch against Telegram Android commit `3de37c8cfb039452be7398909461da6288babf15`, and a manually triggered GitHub Actions build. The patch hides sponsored channel messages and adds a stop-after-current-audio playback option.
+This repository builds Telegram Android **13.2.1 (7291)** from upstream commit
+`7be672ead283d022812d75c729d3a04dd4c2a2c6` and applies `changes.patch`.
 
-Before running the workflow, configure repository Actions secrets `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, and `ANDROID_STORE_PASSWORD`. Use your own Telegram API credentials and a stable private signing key. Never commit them. The build uses the upstream debug variant and upstream sample Google configuration; validate sign-in, push notifications, and the APK before use. It is an unofficial client.
+The patch adds the Telegram Plus app name; local icon tabs for private chats, groups,
+channels, bots, favorites and unread chats; HH:mm:ss message and last-seen times;
+disables Telegram channel/bot/video sponsored ads; adds the English
+**Stop after current audio** toggle (enabled by default, without changing voice messages);
+and opens the selected peer's profile bio when its avatar is tapped in the chat list.
+Favorites are stored locally per account.
 
-Download the `telegram-custom-apk` artifact after a successful Actions run. The upstream source is available at https://github.com/DrKLO/Telegram and is licensed under GPL-2.0-or-later; this patch is distributed under the same terms.
+## Build
+
+The **Build Telegram Plus APK** workflow runs when the patch/workflow is pushed to
+`main`, or manually from **Actions → Build Telegram Plus APK → Run workflow**.
+After success, download **telegram-plus-13.2.1-apk** from the run's Artifacts section.
+Extract the ZIP to obtain the signed universal APK.
+
+The existing six repository Actions secrets are reused:
+`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, `ANDROID_STORE_PASSWORD`.
+Do not commit credentials or signing keys. Keep the original signing key to update
+an existing installation. The build retains the previous `org.telegram.messenger.beta`
+package and signed `afatDebug` variant. It uses the upstream sample Google configuration;
+validate sign-in, notifications, and behavior on a device.
+
+This is an unofficial client. Telegram source and this patch are distributed under
+GPL-2.0-or-later; upstream: https://github.com/DrKLO/Telegram.

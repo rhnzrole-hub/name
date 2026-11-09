@@ -1,6 +1,18 @@
-name: Build unofficial Telegram APK
+name: Build Telegram Plus APK
 on:
+  push:
+    branches: [main]
+    paths:
+      - changes.patch
+      - .github/workflows/build.yml
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-plus-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -31,9 +43,12 @@ jobs:
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - name: Fetch source and apply changes
         run: |
-          git clone --no-checkout https://github.com/DrKLO/Telegram.git source
-          git -C source checkout 3de37c8cfb039452be7398909461da6288babf15
-          git -C source submodule update --init --recursive --depth 1
+          git init source
+          git -C source remote add origin https://github.com/DrKLO/Telegram.git
+          git -C source fetch --depth 1 origin 7be672ead283d022812d75c729d3a04dd4c2a2c6
+          git -C source checkout --detach FETCH_HEAD
+          git -C source submodule update --init --recursive --depth 1 --jobs 4
+          git -C source apply --check "$GITHUB_WORKSPACE/changes.patch"
           git -C source apply "$GITHUB_WORKSPACE/changes.patch"
       - name: Configure credentials
         env:
@@ -41,7 +56,8 @@ jobs:
           API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo "$KEYSTORE" | base64 -d > source/TMessagesProj/config/release.keystore
+          umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > source/TMessagesProj/config/release.keystore
           python3 - <<'PY'
           import os, pathlib, re
           p = pathlib.Path('source/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java')
@@ -49,20 +65,31 @@ jobs:
           api_id, api_hash = os.environ['API_ID'], os.environ['API_HASH']
           if not api_id.isdigit() or not re.fullmatch(r'[0-9a-fA-F]{32}', api_hash):
               raise SystemExit('Invalid API ID or API hash')
-          s = re.sub(r'public static int APP_ID = \d+;', 'public static int APP_ID = ' + api_id + ';', s)
-          s = re.sub(r'public static String APP_HASH = "[^"]*";', 'public static String APP_HASH = "' + api_hash + '";', s)
+          s, id_count = re.subn(r'public static int APP_ID = \d+;', 'public static int APP_ID = ' + api_id + ';', s)
+          s, hash_count = re.subn(r'public static String APP_HASH = "[^"]*";', 'public static String APP_HASH = "' + api_hash + '";', s)
+          if id_count != 1 or hash_count != 1:
+              raise SystemExit('Could not configure upstream Telegram API fields')
           s = s.replace('public static boolean SUPPORTS_PASSKEYS = true;', 'public static boolean SUPPORTS_PASSKEYS = false;')
           p.write_text(s)
           PY
       - name: Build APK
         working-directory: source
         env:
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
-        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon --stacktrace "-PRELEASE_KEY_ALIAS=$KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$STORE_PASSWORD"
+          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon --max-workers=2 --stacktrace '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g' "-PRELEASE_KEY_ALIAS=$ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD"
+      - name: Verify signed APK
+        run: |
+          for apk in source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk; do
+            "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: telegram-custom-apk
+          name: telegram-plus-13.2.1-apk
           path: source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk
           if-no-files-found: error
+      - name: Remove signing material
+        if: always()
+        run: rm -f source/TMessagesProj/config/release.keystore
