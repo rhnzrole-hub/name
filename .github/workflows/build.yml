@@ -1,7 +1,7 @@
 name: Build Telegram Plus APK
 on:
   push:
-    branches: [main, build/telegram-plus-7292-final]
+    branches: [main, build/telegram-plus-7292-final, build/telegram-plus-7292-hidden-icon]
     paths:
       - changes.patch
       - .github/workflows/build.yml
