@@ -3,12 +3,17 @@
 This repository builds Telegram Android **13.2.1 (custom build 7292)** from upstream commit
 `7be672ead283d022812d75c729d3a04dd4c2a2c6` and applies `changes.patch`.
 
-The patch adds the Telegram Plus app name; local icon tabs for private chats, groups,
-channels, bots, favorites and unread chats; HH:mm:ss message and last-seen times;
+The patch adds the Telegram Plus app name; six fixed icon-only default tabs in the order
+All chats, Bots, Users, Groups, Supergroups, Channels; HH:mm:ss message and last-seen times;
 disables Telegram channel/bot/video sponsored ads; adds the English
 **Stop after current audio** toggle (enabled by default, without changing voice messages);
-and opens the selected peer's profile bio when its avatar is tapped in the chat list.
-Favorites are stored locally per account. Up to **10 accounts** can be added without Premium;
+and opens the selected peer's profile bio when its avatar or story ring is tapped in the chat list,
+without waiting for shared-media network loading.
+The six tabs fit on one screen without scrolling, with unread badges over the icons.
+Basic groups and supergroups are filtered separately.
+Long-press actions **Add to folder** and **Remove from folder** support per-account local overrides.
+Any chat type can be included in any category without removing it from its existing categories;
+removal only hides it from the chosen category. All chats remains the complete list. Favorites are stored locally per account. Up to **10 accounts** can be added without Premium;
 the Java account slots and native connection instances have both been expanded.
 
 ## Build

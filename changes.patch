@@ -278,10 +278,10 @@ index 9d0077ff..f398eea8 100644
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/PlusChatFolders.java b/TMessagesProj/src/main/java/org/telegram/messenger/PlusChatFolders.java
 new file mode 100644
-index 00000000..8cbd3b30
+index 00000000..ad444ed3
 --- /dev/null
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/PlusChatFolders.java
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,229 @@
 +package org.telegram.messenger;
 +
 +import android.content.SharedPreferences;
@@ -300,6 +300,8 @@ index 00000000..8cbd3b30
 +    public static final int BOTS = 103;
 +    public static final int FAVORITES = 104;
 +    public static final int UNREAD = 105;
++    public static final int SUPERGROUPS = 106;
++    private static final int[] DEFAULT_TYPES = {BOTS, PRIVATE, GROUPS, SUPERGROUPS, CHANNELS};
 +    private static final String FAVORITES_KEY = "plus_favorite_dialogs";
 +
 +    private final int account;
@@ -307,7 +309,7 @@ index 00000000..8cbd3b30
 +
 +    public PlusChatFolders(int account) {
 +        this.account = account;
-+        for (int type = PRIVATE; type <= UNREAD; type++) {
++        for (int type : DEFAULT_TYPES) {
 +            MessagesController.DialogFilter filter = new MessagesController.DialogFilter();
 +            filter.id = -type;
 +            filter.localId = 1_000_000 + type;
@@ -316,7 +318,7 @@ index 00000000..8cbd3b30
 +    }
 +
 +    public static boolean isLocalType(int type) {
-+        return type >= PRIVATE && type <= UNREAD;
++        return type >= PRIVATE && type <= SUPERGROUPS;
 +    }
 +
 +    public static boolean isLocalFilter(MessagesController.DialogFilter filter) {
@@ -324,27 +326,78 @@ index 00000000..8cbd3b30
 +    }
 +
 +    public ArrayList<MessagesController.DialogFilter> getFilters() {
-+        int[] names = {R.string.PlusPrivateChats, R.string.FilterGroups, R.string.FilterChannels,
-+                R.string.FilterBots, R.string.PlusFavorites, R.string.PlusUnread};
-+        for (int i = 0; i < filters.size(); i++) {
-+            filters.get(i).name = LocaleController.getString(names[i]);
++        for (MessagesController.DialogFilter filter : filters) {
++            int name;
++            switch (-filter.id) {
++                case BOTS: name = R.string.FilterBots; break;
++                case PRIVATE: name = R.string.PlusPrivateChats; break;
++                case GROUPS: name = R.string.FilterGroups; break;
++                case SUPERGROUPS: name = R.string.PlusSupergroups; break;
++                default: name = R.string.FilterChannels; break;
++            }
++            filter.name = LocaleController.getString(name);
 +        }
 +        return filters;
 +    }
 +
 +    public static int getIcon(int type) {
 +        switch (type) {
-+            case PRIVATE: return R.drawable.msg_contacts;
-+            case GROUPS: return R.drawable.msg_groups;
-+            case CHANNELS: return R.drawable.msg_channel;
-+            case BOTS: return R.drawable.msg_bot;
-+            case FAVORITES: return R.drawable.msg_fave;
-+            default: return R.drawable.msg_markunread;
++            case BOTS: return R.drawable.plus_tab_bots;
++            case PRIVATE: return R.drawable.plus_tab_users;
++            case GROUPS: return R.drawable.plus_tab_groups;
++            case SUPERGROUPS: return R.drawable.plus_tab_supergroups;
++            case CHANNELS: return R.drawable.plus_tab_channels;
++            default: return R.drawable.plus_tab_all;
 +        }
 +    }
 +
 +    private SharedPreferences preferences() {
 +        return MessagesController.getInstance(account).getMainSettings();
++    }
++
++    private static boolean isEditableType(int type) {
++        for (int candidate : DEFAULT_TYPES) {
++            if (candidate == type) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private Set<String> membership(int type, boolean included) {
++        String key = (included ? "plus_folder_included_" : "plus_folder_excluded_") + type;
++        return new HashSet<>(preferences().getStringSet(key, new HashSet<>()));
++    }
++
++    public boolean hasManualIncludes(int type) {
++        return isEditableType(type) && !membership(type, true).isEmpty();
++    }
++
++    public void setFolderMembership(int type, ArrayList<Long> dialogIds, boolean included) {
++        if (!isEditableType(type)) {
++            return;
++        }
++        Set<String> include = membership(type, true);
++        Set<String> exclude = membership(type, false);
++        for (long id : dialogIds) {
++            if (id == 0 || DialogObject.isFolderDialogId(id)) {
++                continue;
++            }
++            String key = Long.toString(id);
++            if (included) {
++                include.add(key);
++                exclude.remove(key);
++            } else {
++                include.remove(key);
++                exclude.add(key);
++            }
++        }
++        // Only the chosen category changes; every other folder keeps its membership.
++        preferences().edit()
++                .putStringSet("plus_folder_included_" + type, include)
++                .putStringSet("plus_folder_excluded_" + type, exclude)
++                .apply();
++        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
 +    }
 +
 +    private Set<String> favorites() {
@@ -384,12 +437,28 @@ index 00000000..8cbd3b30
 +    public ArrayList<TLRPC.Dialog> getDialogs(int type) {
 +        MessagesController controller = MessagesController.getInstance(account);
 +        Set<String> favorites = type == FAVORITES ? favorites() : null;
++        boolean editable = isEditableType(type);
++        Set<String> include = editable ? membership(type, true) : null;
++        Set<String> exclude = editable ? membership(type, false) : null;
 +        ArrayList<TLRPC.Dialog> result = new ArrayList<>();
 +        // Favorites remain reachable even when their chats are archived.
-+        ArrayList<TLRPC.Dialog> source = type == FAVORITES ? controller.getAllDialogs() : controller.getDialogs(0);
++        ArrayList<TLRPC.Dialog> source = editable || type == FAVORITES ? controller.getAllDialogs() : controller.getDialogs(0);
 +        for (TLRPC.Dialog dialog : source) {
 +            if (!(dialog instanceof TLRPC.TL_dialog) && !(dialog instanceof TLRPC.TL_dialogCommunity)) {
 +                continue;
++            }
++            if (editable) {
++                String key = Long.toString(dialog.id);
++                if (exclude.contains(key)) {
++                    continue;
++                }
++                if (include.contains(key)) {
++                    result.add(dialog);
++                    continue;
++                }
++                if (dialog.folder_id != 0) {
++                    continue;
++                }
 +            }
 +            if (type == FAVORITES) {
 +                if (favorites.contains(Long.toString(dialog.id))) {
@@ -419,8 +488,10 @@ index 00000000..8cbd3b30
 +            } else if (peerId < 0) {
 +                TLRPC.Chat chat = controller.getChat(-peerId);
 +                if (chat != null) {
-+                    boolean channel = ChatObject.isChannel(chat) && !chat.megagroup && !ChatObject.isCommunity(chat);
-+                    if (type == CHANNELS && channel || type == GROUPS && !channel) {
++                    boolean supergroup = chat.megagroup || ChatObject.isCommunity(chat);
++                    boolean channel = ChatObject.isChannel(chat) && !supergroup;
++                    if (type == CHANNELS && channel || type == SUPERGROUPS && supergroup
++                            || type == GROUPS && !channel && !supergroup) {
 +                        result.add(dialog);
 +                    }
 +                }
@@ -686,7 +757,7 @@ index 4f0508f1..4dd83d3c 100644
  
      void measureTime(MessageObject messageObject) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
-index 698bf4d5..02a0f604 100644
+index 698bf4d5..7cc3a28d 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
 @@ -196,6 +196,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
@@ -697,21 +768,53 @@ index 698bf4d5..02a0f604 100644
      public boolean inPreviewMode;
      private boolean buttonCreated;
      private int ttlPeriod;
-@@ -6177,7 +6178,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -6159,9 +6160,13 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+         return stringBuilder;
+     }
+ 
++    private boolean shouldHandleAvatarStories() {
++        return !avatarOpensProfile && (parentFragment == null || !parentFragment.shouldOpenAvatarProfile());
++    }
++
+     @Override
+     public boolean onInterceptTouchEvent(MotionEvent ev) {
+-        if (rightFragmentOpenedProgress == 0 && !isTopic && !isShareToStoryCell && storyParams.checkOnTouchEvent(ev, this)) {
++        if (shouldHandleAvatarStories() && rightFragmentOpenedProgress == 0 && !isTopic && !isShareToStoryCell && storyParams.checkOnTouchEvent(ev, this)) {
+             return true;
+         }
+         return super.onInterceptTouchEvent(ev);
+@@ -6169,7 +6174,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+ 
+     @Override
+     public boolean dispatchTouchEvent(MotionEvent ev) {
+-        if (!isTopic && !isShareToStoryCell && ev.getAction() == MotionEvent.ACTION_UP || ev.getAction() == MotionEvent.ACTION_CANCEL) {
++        if (shouldHandleAvatarStories() && !isTopic && !isShareToStoryCell
++                && (ev.getAction() == MotionEvent.ACTION_UP || ev.getAction() == MotionEvent.ACTION_CANCEL)) {
+             storyParams.checkOnTouchEvent(ev, this);
+         }
+         return super.dispatchTouchEvent(ev);
+@@ -6177,7 +6183,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
  
      @Override
      public boolean onTouchEvent(MotionEvent event) {
 -        if (rightFragmentOpenedProgress == 0 && !isTopic && !isShareToStoryCell && storyParams.checkOnTouchEvent(event, this)) {
-+        if (!avatarOpensProfile && (parentFragment == null || !parentFragment.shouldOpenAvatarProfile())
-+                && rightFragmentOpenedProgress == 0 && !isTopic && !isShareToStoryCell && storyParams.checkOnTouchEvent(event, this)) {
++        if (shouldHandleAvatarStories() && rightFragmentOpenedProgress == 0 && !isTopic && !isShareToStoryCell && storyParams.checkOnTouchEvent(event, this)) {
              return true;
          }
          if (delegate == null || delegate.canClickButtonInside()) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
-index 40f0f072..f94e69ae 100644
+index 40f0f072..251aec29 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
-@@ -81,6 +81,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
+@@ -52,6 +52,7 @@ import org.telegram.tgnet.ConnectionsManager;
+ import org.telegram.tgnet.TLRPC;
+ import org.telegram.tgnet.tl.TL_account;
+ import org.telegram.ui.ActionBar.Theme;
++import org.telegram.ui.DialogsActivity;
+ import org.telegram.ui.ActionBar.ThemeBind;
+ import org.telegram.ui.Components.AnimatedEmojiDrawable;
+ import org.telegram.ui.Components.AnimatedFloat;
+@@ -81,6 +82,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
      private PhotoBubbleClip bubbleClip;
      private CharSequence currentName;
      public ImageReceiver avatarImage;
@@ -719,18 +822,18 @@ index 40f0f072..f94e69ae 100644
      private AvatarDrawable avatarDrawable;
      private CharSequence subLabel;
      private Theme.ResourcesProvider resourcesProvider;
-@@ -1171,6 +1172,10 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
+@@ -1171,6 +1173,10 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
  
      @Override
      public boolean onTouchEvent(MotionEvent event) {
-+        if (avatarOpensProfile && avatarImage.isInsideImage(event.getX(), event.getY())) {
++        if (avatarOpensProfile && DialogsActivity.isInsideProfileAvatar(avatarImage, event.getX(), event.getY())) {
 +            // Let the list handle avatar taps, including rows with a bot launch button.
 +            return super.onTouchEvent(event);
 +        }
          if (openBot && onOpenButtonClick != null && user != null) {
              final boolean hit = openButtonRect.contains(event.getX(), event.getY());
              if (event.getAction() == MotionEvent.ACTION_DOWN || event.getAction() == MotionEvent.ACTION_MOVE) {
-@@ -1204,7 +1209,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
+@@ -1204,7 +1210,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
              if (hit || adBounce.isPressed())
                  return true;
          }
@@ -888,8 +991,245 @@ index fa2d7e00..772eea9f 100644
          int mode = SharedConfig.repeatMode;
          if (mode == 0 || mode == 1) {
              if (SharedConfig.shuffleMusic) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
+index 400082c6..5756db80 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
+@@ -125,6 +125,7 @@ public class FilterTabsView extends FrameLayout {
+         public boolean isDefault;
+         public boolean isLocked;
+         public boolean noanimate;
++        public int iconRes;
+ 
+         public Tab(int i, CharSequence title, boolean noanimate) {
+             this.id = i;
+@@ -133,6 +134,12 @@ public class FilterTabsView extends FrameLayout {
+         }
+ 
+         public int getWidth(boolean store) {
++            if (compactIconTabs) {
++                if (store) {
++                    counter = Math.max(0, delegate.getTabCounter(id));
++                }
++                return Math.max(1, getCompactTabWidth(Math.max(0, tabs.indexOf(this))) - dp(TAB_PADDING_WIDTH));
++            }
+             int width = titleWidth = (int) Math.ceil(HintView2.measureCorrectly(title, textPaint));
+             int c;
+             if (store) {
+@@ -186,6 +193,10 @@ public class FilterTabsView extends FrameLayout {
+         private int tabWidth;
+         private float tabCounterVisible;
+         private int currentPosition;
++        private Drawable compactIcon;
++        private int compactIconRes;
++        private final Paint compactPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Paint compactBadgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+         private final RectF rect = new RectF();
+         private CharSequence currentText;
+         private boolean currentNoanimate;
+@@ -244,6 +255,10 @@ public class FilterTabsView extends FrameLayout {
+             currentTab = tab;
+             currentPosition = position;
+             setContentDescription(tab.title);
++            if (compactIconTabs && compactIconRes != tab.iconRes) {
++                compactIconRes = tab.iconRes;
++                compactIcon = ContextCompat.getDrawable(getContext(), tab.iconRes).mutate();
++            }
+             requestLayout();
+ 
+             if (currentNoanimate != (currentTab != null && currentTab.noanimate)) {
+@@ -290,13 +305,55 @@ public class FilterTabsView extends FrameLayout {
+ 
+         @Override
+         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+-            int w = currentTab.getWidth(false) + dp(TAB_PADDING_WIDTH) + additionalTabWidth;
++            int w = compactIconTabs ? getCompactTabWidth(currentPosition)
++                    : currentTab.getWidth(false) + dp(TAB_PADDING_WIDTH) + additionalTabWidth;
+             setMeasuredDimension(w, MeasureSpec.getSize(heightMeasureSpec));
+         }
+ 
++        private void drawCompactTab(Canvas canvas) {
++            if (compactIcon == null) {
++                return;
++            }
++            boolean selected = currentTab.id == selectedTabId;
++            int color = Theme.getColor(selected ? activeTextColorKey : unactiveTextColorKey, resourcesProvider);
++            float cx = getWidth() / 2f;
++            float cy = getHeight() / 2f;
++            if (selected) {
++                compactPaint.setColor(Theme.getColor(tabLineColorKey, resourcesProvider));
++                compactPaint.setAlpha(31);
++                rect.set(dp(1), dp(1), getWidth() - dp(1), getHeight() - dp(1));
++                canvas.drawRoundRect(rect, getHeight() / 2f, getHeight() / 2f, compactPaint);
++                compactPaint.setAlpha(255);
++            }
++            int half = dp(12);
++            compactIcon.setBounds((int) cx - half, (int) cy - half, (int) cx + half, (int) cy + half);
++            compactIcon.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
++            compactIcon.draw(canvas);
++            if (currentTab.counter > 0) {
++                String count = currentTab.counter > 99 ? "99+" : Integer.toString(currentTab.counter);
++                compactBadgePaint.setTypeface(AndroidUtilities.bold());
++                compactBadgePaint.setTextSize(dp(10));
++                float width = Math.max(dp(14), compactBadgePaint.measureText(count) + dp(6));
++                float right = Math.min(getWidth() - dp(2), cx + dp(23));
++                float bottom = Math.min(getHeight() - dp(1), cy + dp(13));
++                rect.set(right - width, bottom - dp(14), right, bottom);
++                compactPaint.setColor(Theme.getColor(selected ? Theme.key_chats_tabUnreadActiveBackground
++                        : Theme.key_chats_tabUnreadUnactiveBackground, resourcesProvider));
++                canvas.drawRoundRect(rect, dp(7), dp(7), compactPaint);
++                compactBadgePaint.setColor(Theme.getColor(backgroundColorKey, resourcesProvider));
++                canvas.drawText(count, rect.centerX() - compactBadgePaint.measureText(count) / 2f,
++                        rect.centerY() - (compactBadgePaint.ascent() + compactBadgePaint.descent()) / 2f,
++                        compactBadgePaint);
++            }
++        }
++
+         @SuppressLint("DrawAllocation")
+         @Override
+         protected void onDraw(@NonNull Canvas canvas) {
++            if (compactIconTabs) {
++                drawCompactTab(canvas);
++                return;
++            }
+             boolean reorderEnabled = true;
+             boolean showRemove = !currentTab.isDefault && reorderEnabled;
+             if (reorderEnabled && editingAnimationProgress != 0) {
+@@ -809,6 +866,8 @@ public class FilterTabsView extends FrameLayout {
+ 
+     private int currentPosition;
+     private int selectedTabId = -1;
++    private boolean compactIconTabs;
++    private int compactTabsWidth;
+     private int allTabsWidth;
+ 
+     private int additionalTabWidth;
+@@ -1059,6 +1118,10 @@ public class FilterTabsView extends FrameLayout {
+         listView.setSelectorRadius(6);
+         ThemeBind.listSelectorColor(listView, selectorColorKey, resourcesProvider);
+         listView.setLayoutManager(layoutManager = new LinearLayoutManager(context, LinearLayoutManager.HORIZONTAL, false) {
++            @Override
++            public boolean canScrollHorizontally() {
++                return !compactIconTabs && super.canScrollHorizontally();
++            }
+ 
+             @Override
+             public boolean supportsPredictiveItemAnimations() {
+@@ -1145,6 +1208,27 @@ public class FilterTabsView extends FrameLayout {
+         addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+     }
+ 
++    public void setCompactIconTabs(boolean compact) {
++        if (compactIconTabs != compact) {
++            compactIconTabs = compact;
++            compactTabsWidth = 0;
++            listView.setOverScrollMode(compact ? View.OVER_SCROLL_NEVER : View.OVER_SCROLL_IF_CONTENT_SCROLLS);
++            listView.scrollToPosition(0);
++            requestLayout();
++        }
++    }
++
++    private int getCompactTabWidth(int position) {
++        int count = Math.max(1, tabs.size());
++        int width = compactTabsWidth > 0 ? compactTabsWidth : dp(48) * count;
++        return width * (position + 1) / count - width * position / count;
++    }
++
++    public void addIconTab(int id, int stableId, CharSequence label, int iconRes, boolean isDefault) {
++        addTab(id, stableId, label, true, isDefault, false);
++        tabs.get(tabs.size() - 1).iconRes = iconRes;
++    }
++
+     public void setDelegate(FilterTabsViewDelegate filterTabsViewDelegate) {
+         delegate = filterTabsViewDelegate;
+     }
+@@ -1310,7 +1394,7 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     public void finishAddingTabs(boolean animated) {
+-        listView.setItemAnimator(animated ? itemAnimator : null);
++        listView.setItemAnimator(!compactIconTabs && animated ? itemAnimator : null);
+         adapter.notifyDataSetChanged();
+     }
+ 
+@@ -1447,6 +1531,9 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     private void drawSelector(Canvas canvas) {
++        if (compactIconTabs) {
++            return;
++        }
+         final int height = getMeasuredHeight();
+         selectorDrawable.setAlpha((int) (255 * listView.getAlpha()));
+         float indicatorX = 0;
+@@ -1542,6 +1629,20 @@ public class FilterTabsView extends FrameLayout {
+ 
+     @Override
+     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
++        if (compactIconTabs && !tabs.isEmpty()) {
++            int width = Math.max(0, MeasureSpec.getSize(widthMeasureSpec) - listViewPaddingH * 2);
++            if (compactTabsWidth != width) {
++                compactTabsWidth = width;
++                ignoreLayout = true;
++                adapter.notifyDataSetChanged();
++                ignoreLayout = false;
++            }
++            additionalTabWidth = 0;
++            updateTabsWidths();
++            invalidated = false;
++            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
++            return;
++        }
+         if (!tabs.isEmpty()) {
+             final int width = MeasureSpec.getSize(widthMeasureSpec) - listViewPaddingH * 2;
+             Tab firstTab = findDefaultTab();
+@@ -1586,6 +1687,9 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     private void scrollToChild(int position) {
++        if (compactIconTabs) {
++            return;
++        }
+         if (tabs.isEmpty() || scrollingToChild == position || position < 0 || position >= tabs.size()) {
+             return;
+         }
+@@ -1678,6 +1782,9 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     public void setIsEditing(boolean value) {
++        if (compactIconTabs && value) {
++            return;
++        }
+         isEditing = value;
+         editingForwardAnimation = true;
+         listView.invalidateViews();
+@@ -1704,6 +1811,13 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     public void checkTabsCounter() {
++        if (compactIconTabs) {
++            for (Tab tab : tabs) {
++                tab.getWidth(true);
++            }
++            listView.invalidateViews();
++            return;
++        }
+         boolean changed = false;
+         for (int a = 0, N = tabs.size(); a < N; a++) {
+             Tab tab = tabs.get(a);
+@@ -1734,6 +1848,10 @@ public class FilterTabsView extends FrameLayout {
+     }
+ 
+     public void notifyTabCounterChanged(int id) {
++        if (compactIconTabs) {
++            checkTabsCounter();
++            return;
++        }
+         int position = idToPosition.get(id, -1);
+         if (position < 0 || position >= tabs.size()) {
+             return;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
-index c226b737..7d42aa24 100644
+index c226b737..3ca5fb0f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
 @@ -127,6 +127,7 @@ import org.telegram.messenger.NotificationsController;
@@ -1006,7 +1346,7 @@ index c226b737..7d42aa24 100644
                  }
              });
          }
-@@ -3835,6 +3853,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -3835,7 +3853,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                      fragmentSearchFieldWatcher.toggleSearch(true);
                  } else if (id == 11) {
                      openAccountSelector(switchItem);
@@ -1014,18 +1354,27 @@ index c226b737..7d42aa24 100644
 +                    getPlusChatFolders().toggleFavorites(new ArrayList<>(selectedDialogs));
 +                    hideActionMode(true);
                  } else if (id == add_to_folder) {
++                    if (usesPlusFolderActions()) {
++                        showPlusFolderPicker(new ArrayList<>(selectedDialogs), false, () -> hideActionMode(true));
++                        return;
++                    }
                      FiltersListBottomSheet sheet = new FiltersListBottomSheet(DialogsActivity.this, selectedDialogs);
                      sheet.setDelegate((filter, checked) -> {
-@@ -3895,7 +3916,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                         ArrayList<Long> alwaysShow = FiltersListBottomSheet.getDialogsCount(DialogsActivity.this, filter, selectedDialogs, true, false);
+@@ -3895,7 +3920,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                      });
                      showDialog(sheet);
                  } else if (id == remove_from_folder) {
 -                    MessagesController.DialogFilter filter = getMessagesController().getDialogFilters().get(viewPages[0].selectedType);
++                    if (usesPlusFolderActions()) {
++                        showPlusFolderPicker(new ArrayList<>(selectedDialogs), true, () -> hideActionMode(true));
++                        return;
++                    }
 +                    MessagesController.DialogFilter filter = getChatTabFilters().get(viewPages[0].selectedType);
                      ArrayList<Long> neverShow = FiltersListBottomSheet.getDialogsCount(DialogsActivity.this, filter, selectedDialogs, false, false);
  
                      int currentCount;
-@@ -4286,6 +4307,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -4286,6 +4315,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              viewPage.listView.setOnItemClickListener((view, position, x, y) -> {
                  if (view instanceof GraySectionCell)
                      return;
@@ -1035,18 +1384,82 @@ index c226b737..7d42aa24 100644
                  if (view instanceof DialogCell && ((DialogCell) view).isBlocked()) {
                      showPremiumBlockedToast(view, ((DialogCell) view).getDialogId());
                      return;
-@@ -6667,6 +6691,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -6667,8 +6699,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
          actionMode.addView(new View(getContext()), LayoutHelper.createLinear(5, LayoutHelper.MATCH_PARENT));
          archiveItem = otherItem.addSubItem(archive, R.drawable.msg_archive, LocaleController.getString(R.string.Archive));
          pin2Item = otherItem.addSubItem(pin2, R.drawable.msg_pin, LocaleController.getString(R.string.DialogPin));
+-        addToFolderItem = otherItem.addSubItem(add_to_folder, R.drawable.msg_addfolder, LocaleController.getString(R.string.FilterAddTo));
+-        removeFromFolderItem = otherItem.addSubItem(remove_from_folder, R.drawable.msg_removefolder, LocaleController.getString(R.string.FilterRemoveFrom));
 +        favoritesItem = otherItem.addSubItem(plus_favorites, R.drawable.msg_fave, LocaleController.getString(R.string.PlusAddToFavorites));
-         addToFolderItem = otherItem.addSubItem(add_to_folder, R.drawable.msg_addfolder, LocaleController.getString(R.string.FilterAddTo));
-         removeFromFolderItem = otherItem.addSubItem(remove_from_folder, R.drawable.msg_removefolder, LocaleController.getString(R.string.FilterRemoveFrom));
++        addToFolderItem = otherItem.addSubItem(add_to_folder, R.drawable.msg_addfolder,
++                LocaleController.getString(usesPlusFolderActions() ? R.string.PlusAddToFolder : R.string.FilterAddTo));
++        removeFromFolderItem = otherItem.addSubItem(remove_from_folder, R.drawable.msg_removefolder,
++                LocaleController.getString(usesPlusFolderActions() ? R.string.PlusRemoveFromFolder : R.string.FilterRemoveFrom));
          readItem = otherItem.addSubItem(read, R.drawable.msg_markread, LocaleController.getString(R.string.MarkAsRead));
-@@ -6695,6 +6720,51 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         clearItem = otherItem.addSubItem(clear, R.drawable.msg_clear, LocaleController.getString(R.string.ClearHistory));
+         blockItem = otherItem.addSubItem(block, R.drawable.msg_block, LocaleController.getString(R.string.BlockUser));
+@@ -6695,6 +6730,97 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
          }
      }
  
++    private boolean usesPlusFolderActions() {
++        return !onlySelect && initialDialogsType == DIALOGS_TYPE_DEFAULT;
++    }
++
++    private void showPlusFolderPicker(ArrayList<Long> selected, boolean remove, Runnable onSelected) {
++        if (getParentActivity() == null) {
++            return;
++        }
++        ArrayList<Long> ids = new ArrayList<>();
++        for (long id : selected) {
++            if (id != 0 && !DialogObject.isFolderDialogId(id)) {
++                ids.add(id);
++            }
++        }
++        if (ids.isEmpty()) {
++            return;
++        }
++        ArrayList<MessagesController.DialogFilter> choices = new ArrayList<>();
++        ArrayList<CharSequence> labels = new ArrayList<>();
++        ArrayList<Integer> icons = new ArrayList<>();
++        HashSet<Long> selectedIds = new HashSet<>(ids);
++        for (MessagesController.DialogFilter filter : getPlusChatFolders().getFilters()) {
++            if (remove) {
++                boolean containsSelected = false;
++                for (TLRPC.Dialog dialog : getPlusChatFolders().getDialogs(-filter.id)) {
++                    if (selectedIds.contains(dialog.id)) {
++                        containsSelected = true;
++                        break;
++                    }
++                }
++                if (!containsSelected) {
++                    continue;
++                }
++            }
++            choices.add(filter);
++            labels.add(filter.name);
++            icons.add(PlusChatFolders.getIcon(-filter.id));
++        }
++        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
++        builder.setTitle(LocaleController.getString(remove ? R.string.PlusRemoveFromFolder : R.string.PlusAddToFolder));
++        if (choices.isEmpty()) {
++            builder.setMessage(LocaleController.getString(R.string.PlusNoFolderMembership));
++            builder.setPositiveButton(LocaleController.getString(R.string.OK), null);
++        } else {
++            int[] iconIds = new int[icons.size()];
++            for (int i = 0; i < iconIds.length; i++) {
++                iconIds[i] = icons.get(i);
++            }
++            builder.setItems(labels.toArray(new CharSequence[0]), iconIds, (dialog, index) -> {
++                if (onSelected != null) {
++                    onSelected.run();
++                }
++                getPlusChatFolders().setFolderMembership(-choices.get(index).id, ids, !remove);
++            });
++        }
++        showDialog(builder.create());
++    }
++
 +    private boolean hasPlusChatTabs() {
 +        return initialDialogsType == DIALOGS_TYPE_DEFAULT && !onlySelect && folderId == 0 && communityId == 0 && TextUtils.isEmpty(searchString);
 +    }
@@ -1076,35 +1489,35 @@ index c226b737..7d42aa24 100644
 +        }
 +        result.add(all);
 +        result.addAll(getPlusChatFolders().getFilters());
-+        for (MessagesController.DialogFilter filter : cloud) {
-+            if (!filter.isDefault()) {
-+                result.add(filter);
-+            }
-+        }
++        // The default strip always has exactly six categories; cloud folders remain in Settings.
 +        return result;
-+    }
-+
-+    private CharSequence plusTabTitle(MessagesController.DialogFilter filter) {
-+        ColoredImageSpan icon = new ColoredImageSpan(PlusChatFolders.getIcon(-filter.id), ColoredImageSpan.ALIGN_CENTER);
-+        icon.setSize(dp(20));
-+        SpannableStringBuilder title = new SpannableStringBuilder("  ").append(filter.name);
-+        title.setSpan(icon, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-+        return title;
 +    }
 +
      public void scrollToFolder(int fid) {
          if (filterTabsView == null) {
              updateFilterTabs(true, true);
-@@ -6703,7 +6773,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -6702,8 +6828,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 return;
              }
          }
-         int index = filterTabsView.getTabsCount() - 1;
+-        int index = filterTabsView.getTabsCount() - 1;
 -        ArrayList<MessagesController.DialogFilter> filters = getMessagesController().getDialogFilters();
++        int index = hasPlusChatTabs() ? -1 : filterTabsView.getTabsCount() - 1;
 +        ArrayList<MessagesController.DialogFilter> filters = getChatTabFilters();
          for (int i = 0; i < filters.size(); ++i) {
              if (filters.get(i).id == fid) {
                  index = i;
-@@ -6727,11 +6797,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -6711,6 +6837,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             }
+         }
+ 
++        if (index < 0) {
++            return;
++        }
+         FilterTabsView.Tab tab = filterTabsView.getTab(index);
+         if (tab != null) {
+             if (viewPages != null && viewPages.length > 0 && viewPages[0].selectedType == tab.id) {
+@@ -6727,11 +6856,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              viewPages[a].listView.stopScroll();
          }
          int a = animated && viewPages.length > 1 ? 1 : 0;
@@ -1122,7 +1535,7 @@ index c226b737..7d42aa24 100644
              viewPages[a].dialogsType = initialDialogsType;
              viewPages[a].listView.updatePullState();
          } else {
-@@ -6779,7 +6852,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -6779,7 +6911,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              filterOptions.dismiss();
              filterOptions = null;
          }
@@ -1131,24 +1544,34 @@ index c226b737..7d42aa24 100644
          if (filters.size() > 1) {
              if (force || filterTabsView.getVisibility() != View.VISIBLE) {
                  boolean animatedUpdateItems = animated;
-@@ -6802,7 +6875,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -6796,13 +6928,19 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                     filterTabsView.resetTabId();
+                     selectWithStableId = true;
+                 }
++                filterTabsView.setCompactIconTabs(hasPlusChatTabs());
+                 filterTabsView.removeTabs();
+                 for (int a = 0, N = filters.size(); a < N; a++) {
+-                    if (filters.get(a).isDefault()) {
++                    if (hasPlusChatTabs()) {
++                        MessagesController.DialogFilter filter = filters.get(a);
++                        filterTabsView.addIconTab(a, filter.isDefault() ? 0 : filter.localId,
++                                filter.isDefault() ? LocaleController.getString(R.string.FilterAllChats) : filter.name,
++                                PlusChatFolders.getIcon(filter.isDefault() ? 0 : -filter.id), filter.isDefault());
++                    } else if (filters.get(a).isDefault()) {
                          filterTabsView.addTab(a, 0, LocaleController.getString(R.string.FilterAllChats), null, false, true, filters.get(a).locked);
                      } else {
                          final MessagesController.DialogFilter filter = filters.get(a);
 -                        filterTabsView.addTab(a, filter.localId, filter.name, filter.entities, filter.title_noanimate, false, filters.get(a).locked);
-+                        if (PlusChatFolders.isLocalFilter(filter)) {
-+                            filterTabsView.addTab(a, filter.localId, plusTabTitle(filter), true, false, false);
-+                        } else {
-+                            filterTabsView.addTab(a, filter.localId, filter.name, filter.entities, filter.title_noanimate, false, filter.locked);
-+                        }
++                        filterTabsView.addTab(a, filter.localId, filter.name, filter.entities, filter.title_noanimate, false, filter.locked);
                      }
                  }
                  if (stableId >= 0) {
-@@ -7749,8 +7826,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -7749,8 +7887,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
          boolean loadArchivedFromCache = false;
          boolean load = false;
          boolean loadFromCache = false;
-+        if (viewPage.dialogsType == PlusChatFolders.FAVORITES) {
++        if (viewPage.dialogsType == PlusChatFolders.FAVORITES
++                || PlusChatFolders.isLocalType(viewPage.dialogsType) && getPlusChatFolders().hasManualIncludes(viewPage.dialogsType)) {
 +            loadArchivedFromCache = !getMessagesController().isDialogsEndReached(1);
 +            loadArchived = loadArchivedFromCache || !getMessagesController().isServerDialogsEndReached(1);
 +        }
@@ -1158,13 +1581,23 @@ index c226b737..7d42aa24 100644
              if (viewPage.selectedType >= 0 && viewPage.selectedType < dialogFilters.size()) {
                  MessagesController.DialogFilter filter = dialogFilters.get(viewPage.selectedType);
                  if ((filter.flags & MessagesController.DIALOG_FILTER_FLAG_EXCLUDE_ARCHIVED) == 0) {
-@@ -7787,7 +7868,64 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -7787,7 +7930,74 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
          }
      }
  
 +    public boolean shouldOpenAvatarProfile() {
 +        return !onlySelect && !clickSelectsDialog() && getParentActivity() != null
 +                && actionBar != null && !actionBar.isActionModeShowed();
++    }
++
++    public static boolean isInsideProfileAvatar(ImageReceiver avatar, float x, float y) {
++        if (avatar == null || avatar.getImageWidth() <= 0 || avatar.getImageHeight() <= 0) {
++            return false;
++        }
++        // Include the visible story ring as part of the avatar's tap target.
++        int inset = dp(6);
++        return x >= avatar.getImageX() - inset && x <= avatar.getImageX2() + inset
++                && y >= avatar.getImageY() - inset && y <= avatar.getImageY2() + inset;
 +    }
 +
 +    private boolean openProfileFromAvatar(View view, float x, float y) {
@@ -1184,7 +1617,7 @@ index c226b737..7d42aa24 100644
 +        } else {
 +            return false;
 +        }
-+        if (avatar == null || !avatar.isInsideImage(x, y) || peerId == 0 || DialogObject.isFolderDialogId(peerId)) {
++        if (!isInsideProfileAvatar(avatar, x, y) || peerId == 0 || DialogObject.isFolderDialogId(peerId)) {
 +            return false;
 +        }
 +        if (view instanceof ProfileSearchCell) {
@@ -1223,7 +1656,16 @@ index c226b737..7d42aa24 100644
          if (getParentActivity() == null) {
              return;
          }
-@@ -8544,6 +8682,21 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -8433,7 +8643,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         final ArrayList<Long> dialogIdArray = new ArrayList<>();
+         dialogIdArray.add(dialogId);
+ 
+-        boolean hasFolders = communityId == 0 &&
++        boolean hasFolders = !usesPlusFolderActions() && communityId == 0 &&
+             getMessagesController().filtersEnabled &&
+             getMessagesController().dialogFiltersLoaded &&
+             getMessagesController().dialogFilters != null &&
+@@ -8544,6 +8754,38 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
          final BaseFragment[] previewActivity = new BaseFragment[1];
          previewMenu[0] = new ActionBarPopupWindow.ActionBarPopupWindowLayout(getParentActivity(), R.drawable.popup_fixed_alert4, getResourceProvider(), flags);
  
@@ -1242,30 +1684,55 @@ index c226b737..7d42aa24 100644
 +            previewMenu[0].addView(favorite);
 +        }
 +
++        if (usesPlusFolderActions()) {
++            ActionBarMenuSubItem add = new ActionBarMenuSubItem(getParentActivity(), true, false);
++            add.setTextAndIcon(LocaleController.getString(R.string.PlusAddToFolder), R.drawable.msg_addfolder);
++            add.setOnClickListener(v -> {
++                getParentLayout().finishPreviewFragment();
++                showPlusFolderPicker(new ArrayList<>(dialogIdArray), false, null);
++            });
++            previewMenu[0].addView(add);
++            ActionBarMenuSubItem remove = new ActionBarMenuSubItem(getParentActivity(), false, false);
++            remove.setTextAndIcon(LocaleController.getString(R.string.PlusRemoveFromFolder), R.drawable.msg_removefolder);
++            remove.setOnClickListener(v -> {
++                getParentLayout().finishPreviewFragment();
++                showPlusFolderPicker(new ArrayList<>(dialogIdArray), true, null);
++            });
++            previewMenu[0].addView(remove);
++        }
++
          if (hasFolders) {
              foldersMenu[0] = previewMenu[0].addViewToSwipeBack(foldersMenuView);
              ActionBarMenuSubItem addToFolderItem = new ActionBarMenuSubItem(getParentActivity(), true, false);
-@@ -9862,7 +10015,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -9861,8 +10103,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 blockItem.setVisibility(View.VISIBLE);
              }
          }
-         if (removeFromFolderItem != null) {
+-        if (removeFromFolderItem != null) {
 -            boolean cantRemoveFromFolder = filterTabsView == null || filterTabsView.getVisibility() != View.VISIBLE || filterTabsView.currentTabIsDefault();
++        if (removeFromFolderItem != null && usesPlusFolderActions()) {
++            removeFromFolderItem.setVisibility(View.VISIBLE);
++        } else if (removeFromFolderItem != null) {
 +            boolean cantRemoveFromFolder = PlusChatFolders.isLocalType(viewPages[0].dialogsType) || filterTabsView == null || filterTabsView.getVisibility() != View.VISIBLE || filterTabsView.currentTabIsDefault();
              if (!cantRemoveFromFolder) {
                  try {
                      final int dialogsCount = getDialogsArray(currentAccount, viewPages[0].dialogsAdapter.getDialogsType(), folderId, dialogsListFrozen).size();
-@@ -9876,6 +10029,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -9876,7 +10120,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                  removeFromFolderItem.setVisibility(View.VISIBLE);
              }
          }
+-        if (addToFolderItem != null) {
 +        if (favoritesItem != null) {
 +            favoritesItem.setTextAndIcon(LocaleController.getString(getPlusChatFolders().areAllFavorites(selectedDialogs)
 +                    ? R.string.PlusRemoveFromFavorites : R.string.PlusAddToFavorites), R.drawable.msg_fave);
 +        }
-         if (addToFolderItem != null) {
++        if (addToFolderItem != null && usesPlusFolderActions()) {
++            addToFolderItem.setVisibility(View.VISIBLE);
++        } else if (addToFolderItem != null) {
              if (folderId == 1 || filterTabsView != null && getFilterTabsVisibilityFactor(false) > 0.5f && filterTabsView.currentTabIsDefault() && !FiltersListBottomSheet.getCanAddDialogFilters(this, selectedDialogs).isEmpty()) {
                  addToFolderItem.setVisibility(View.VISIBLE);
-@@ -10455,7 +10612,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             } else {
+@@ -10455,7 +10705,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                  if (viewPages[0].dialogsType == 7 || viewPages[0].dialogsType == 8) {
                      filter = getMessagesController().selectedDialogFilter[viewPages[0].dialogsType == 8 ? 1 : 0];
                  }
@@ -1274,7 +1741,7 @@ index c226b737..7d42aa24 100644
                  if (slowedReloadAfterDialogClick && isUnread) {
                      // in unread tab dialogs reload too instantly removes dialog from folder after clicking on it
                      AndroidUtilities.runOnUIThread(() -> {
-@@ -10532,6 +10689,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -10532,6 +10782,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              }
              if (viewPages != null) {
                  for (int a = 0; a < viewPages.length; a++) {
@@ -1285,7 +1752,7 @@ index c226b737..7d42aa24 100644
                      if ((mask & MessagesController.UPDATE_MASK_STATUS) != 0) {
                          viewPages[a].dialogsAdapter.sortOnlineContacts(true);
                      }
-@@ -10851,7 +11012,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -10851,7 +11105,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
      }
  
      private void showFiltersHint() {
@@ -1294,7 +1761,7 @@ index c226b737..7d42aa24 100644
              return;
          }
          SharedPreferences preferences = MessagesController.getGlobalMainSettings();
-@@ -10928,7 +11089,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -10928,7 +11182,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              return frozenDialogsList;
          }
          MessagesController messagesController = AccountInstance.getInstance(currentAccount).getMessagesController();
@@ -1305,7 +1772,7 @@ index c226b737..7d42aa24 100644
              return messagesController.getDialogs(folderId);
          } else if (dialogsType == DIALOGS_TYPE_WIDGET || dialogsType == DIALOGS_TYPE_IMPORT_HISTORY) {
              return messagesController.dialogsServerOnly;
-@@ -12820,6 +12983,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -12820,6 +13076,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              }
          });
          searchViewPager.channelsSearchListView.setOnItemClickListener((view, position, x, y) -> {
@@ -1315,7 +1782,7 @@ index c226b737..7d42aa24 100644
              Object obj = searchViewPager.channelsSearchAdapter.getObject(position);
              if (obj instanceof TLRPC.Chat) {
                  Bundle args = new Bundle();
-@@ -12841,6 +13007,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -12841,6 +13100,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
              }
          });
          searchViewPager.botsSearchListView.setOnItemClickListener((view, position, x, y) -> {
@@ -1325,7 +1792,7 @@ index c226b737..7d42aa24 100644
              Object obj = searchViewPager.botsSearchAdapter.getObject(position);
              if (obj instanceof TLRPC.User) {
                  presentFragment(ProfileActivity.of(((TLRPC.User) obj).id));
-@@ -12904,6 +13073,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+@@ -12904,6 +13166,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                  searchViewPager.dialogsSearchAdapter.clickedSponsoredPeer(peer);
                  return;
              }
@@ -1372,18 +1839,19 @@ index 1e4ad20e..2c0a96e5 100644
              currentMessageObject = newMessageObject;
              if (newMessageObject != null) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
-index 0e2e0893..2338cf36 100644
+index 0e2e0893..1cf3f11c 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
-@@ -870,6 +870,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+@@ -870,6 +870,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
          }
      };
      private boolean fragmentOpened;
 +    private boolean openBioRequested;
++    private boolean bioScrollPosted;
      private NestedFrameLayout contentView;
      private float titleAnimationsYDiff;
      private float customAvatarProgress;
-@@ -2086,6 +2087,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+@@ -2086,6 +2088,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
      @Override
      public boolean onFragmentCreate() {
          userId = arguments.getLong("user_id", 0);
@@ -1391,7 +1859,18 @@ index 0e2e0893..2338cf36 100644
          chatId = arguments.getLong("chat_id", 0);
          topicId = arguments.getLong("topic_id", 0);
          saved = arguments.getBoolean("saved", false);
-@@ -10044,6 +10046,9 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+@@ -9774,6 +9777,10 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+ 
+     @Override
+     public boolean needDelayOpenAnimation() {
++        if (openBioRequested) {
++            // Avatar navigation must not wait for shared-media counts or a network timeout.
++            return false;
++        }
+         if (playProfileAnimation == 0) {
+             return true;
+         }
+@@ -10044,6 +10051,9 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
          }
          transitionAnimationInProress = false;
          checkPhotoDescriptionAlpha();
@@ -1401,7 +1880,7 @@ index 0e2e0893..2338cf36 100644
      }
  
      @Keep
-@@ -11315,6 +11320,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+@@ -11315,6 +11325,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
              musicView.invalidate();
              balanceView.invalidate();
          }
@@ -1409,16 +1888,18 @@ index 0e2e0893..2338cf36 100644
      }
  
      private Drawable getScamDrawable(int type) {
-@@ -15465,6 +15471,23 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
+@@ -15465,6 +15476,25 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
          }
      }
  
 +    private void scrollToBioIfRequested() {
-+        if (!openBioRequested || !fragmentOpened || listView == null || layoutManager == null) {
++        if (!openBioRequested || bioScrollPosted || !fragmentOpened || listView == null || layoutManager == null) {
 +            return;
 +        }
 +        // Row positions can change when full user/chat info arrives asynchronously.
++        bioScrollPosted = true;
 +        listView.post(() -> {
++            bioScrollPosted = false;
 +            if (!openBioRequested || listView == null || layoutManager == null) {
 +                return;
 +            }
@@ -1433,6 +1914,66 @@ index 0e2e0893..2338cf36 100644
      public void scrollToSharedMedia() {
          scrollToSharedMedia(false);
      }
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_all.xml b/TMessagesProj/src/main/res/drawable/plus_tab_all.xml
+new file mode 100644
+index 00000000..38442573
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_all.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M3,3h6v6h-6z M15,3h6v6h-6z M3,15h6v6h-6z M15,15h6v6h-6z" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_bots.xml b/TMessagesProj/src/main/res/drawable/plus_tab_bots.xml
+new file mode 100644
+index 00000000..d4018f1d
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_bots.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M6,7h12a2,2 0,0 1,2 2v9a2,2 0,0 1,-2 2h-12a2,2 0,0 1,-2 -2v-9a2,2 0,0 1,2 -2z M12,3v4 M1,11v5 M23,11v5 M8,12v2 M16,12v2 M9,17h6" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_channels.xml b/TMessagesProj/src/main/res/drawable/plus_tab_channels.xml
+new file mode 100644
+index 00000000..44c0a3b3
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_channels.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M3,9h6l11,-5v15l-11,-5h-6z M9,9v5 M6,14l2,7h4l-2,-7 M23,9v5" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_groups.xml b/TMessagesProj/src/main/res/drawable/plus_tab_groups.xml
+new file mode 100644
+index 00000000..6d361ef2
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_groups.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M9,4a3.5,3.5 0,1 1,0 7a3.5,3.5 0,1 1,0 -7 M2,21v-2a7,6 0,0 1,14 0v2 M17,4a3.5,3.5 0,0 1,0 7 M18,14a6,5 0,0 1,4 5v2" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_supergroups.xml b/TMessagesProj/src/main/res/drawable/plus_tab_supergroups.xml
+new file mode 100644
+index 00000000..42ff1e1e
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_supergroups.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M12,5a3.2,3.2 0,1 1,0 6.4a3.2,3.2 0,1 1,0 -6.4 M6,21v-2a6,5 0,0 1,12 0v2 M5,3a3,3 0,0 0,0 6 M3,12a4,5 0,0 0,-2 4v2 M19,3a3,3 0,0 1,0 6 M21,12a4,5 0,0 1,2 4v2" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
+diff --git a/TMessagesProj/src/main/res/drawable/plus_tab_users.xml b/TMessagesProj/src/main/res/drawable/plus_tab_users.xml
+new file mode 100644
+index 00000000..c65e0c3f
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/plus_tab_users.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
++    <path android:pathData="M12,3a4,4 0,1 1,0 8a4,4 0,1 1,0 -8 M4,21v-2a7,6 0,0 1,7 -6h2a7,6 0,0 1,7 6v2" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
++</vector>
 diff --git a/TMessagesProj/src/main/res/values-ar/strings.xml b/TMessagesProj/src/main/res/values-ar/strings.xml
 index 8b870043..736b949e 100644
 --- a/TMessagesProj/src/main/res/values-ar/strings.xml
@@ -1532,7 +2073,7 @@ index 03d0ba33..d1d2d105 100644
      <string name="English">Inglês</string>
      <string name="LanguageNameInEnglish">Portuguese (Brazil)</string>
 diff --git a/TMessagesProj/src/main/res/values-ru/strings.xml b/TMessagesProj/src/main/res/values-ru/strings.xml
-index 24c56292..2949d856 100644
+index 24c56292..f22bf2b8 100644
 --- a/TMessagesProj/src/main/res/values-ru/strings.xml
 +++ b/TMessagesProj/src/main/res/values-ru/strings.xml
 @@ -1,7 +1,7 @@
@@ -1545,15 +2086,16 @@ index 24c56292..2949d856 100644
      <string name="LanguageName">Русский</string>
      <string name="English">Английский</string>
      <string name="LanguageNameInEnglish">Russian</string>
-@@ -263,4 +263,9 @@
+@@ -263,4 +263,10 @@
      <string name="RemindTodayAt">\'Отправить сегодня в\' HH:mm</string>
      <string name="RemindDayAt">\'Отправить\' d MMM \'в\' HH:mm</string>
      <string name="RemindDayYearAt">\'Напомнить\' d MMM yyyy \'в\' HH:mm</string>
-+    <string name="PlusPrivateChats">Личные</string>
++    <string name="PlusPrivateChats">Пользователи</string>
 +    <string name="PlusFavorites">Избранные чаты</string>
 +    <string name="PlusUnread">Непрочитанные</string>
 +    <string name="PlusAddToFavorites">Добавить чат в избранные</string>
 +    <string name="PlusRemoveFromFavorites">Убрать чат из избранных</string>
++    <string name="PlusSupergroups">Супергруппы</string>
  </resources>
 \ No newline at end of file
 diff --git a/TMessagesProj/src/main/res/values-uk/strings.xml b/TMessagesProj/src/main/res/values-uk/strings.xml
@@ -1572,20 +2114,21 @@ index d4683443..6f855509 100644
      <string name="LanguageNameInEnglish">Ukrainian</string>
 diff --git a/TMessagesProj/src/main/res/values-uz/strings.xml b/TMessagesProj/src/main/res/values-uz/strings.xml
 new file mode 100644
-index 00000000..415040d1
+index 00000000..1b241e02
 --- /dev/null
 +++ b/TMessagesProj/src/main/res/values-uz/strings.xml
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,9 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<resources>
-+    <string name="PlusPrivateChats">Shaxsiy</string>
++    <string name="PlusPrivateChats">Foydalanuvchilar</string>
 +    <string name="PlusFavorites">Sevimlilar</string>
 +    <string name="PlusUnread">O‘qilmaganlar</string>
 +    <string name="PlusAddToFavorites">Chatni sevimlilarga qo‘shish</string>
 +    <string name="PlusRemoveFromFavorites">Chatni sevimlilardan chiqarish</string>
++    <string name="PlusSupergroups">Superguruhlar</string>
 +</resources>
 diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
-index 9f56ca61..248f3ea4 100644
+index 9f56ca61..c3f7ad7c 100644
 --- a/TMessagesProj/src/main/res/values/strings.xml
 +++ b/TMessagesProj/src/main/res/values/strings.xml
 @@ -1,7 +1,7 @@
@@ -1598,16 +2141,20 @@ index 9f56ca61..248f3ea4 100644
      <string name="LanguageName">English</string>
      <string name="English">English</string>
      <string name="LanguageNameInEnglish">English</string>
-@@ -11678,4 +11678,10 @@
+@@ -11678,4 +11678,14 @@
      <string name="FpnvConsentCountry">Country</string>
      <string name="FpnvConsentMccMnc">MCC / MNC</string>
      <string name="FpnvConsentPhoneNumber">Phone Number</string>
-+    <string name="PlusPrivateChats">Private</string>
++    <string name="PlusPrivateChats">Users</string>
 +    <string name="PlusFavorites">Favorites</string>
 +    <string name="PlusUnread">Unread</string>
 +    <string name="PlusAddToFavorites">Add chat to Favorites</string>
 +    <string name="PlusRemoveFromFavorites">Remove chat from Favorites</string>
 +    <string name="StopAfterCurrentAudio" translatable="false">Stop after current audio</string>
++    <string name="PlusSupergroups">Supergroups</string>
++    <string name="PlusAddToFolder" translatable="false">Add to folder</string>
++    <string name="PlusRemoveFromFolder" translatable="false">Remove from folder</string>
++    <string name="PlusNoFolderMembership" translatable="false">The selected chats are not in any folder.</string>
  </resources>
 diff --git a/gradle.properties b/gradle.properties
 index 574e3b80..b75205f6 100644
