@@ -20,7 +20,7 @@ the Java account slots and native connection instances have both been expanded.
 
 The **Build Telegram Plus APK** workflow runs when the patch/workflow is pushed to
 `main`, or manually from **Actions → Build Telegram Plus APK → Run workflow**.
-After success, download **telegram-plus-13.2.1-10accounts-apk** from the run's Artifacts section.
+After success, download **telegram-plus-13.2.1-final-apk** from the run's Artifacts section.
 Extract the ZIP to obtain the signed universal APK.
 
 The existing six repository Actions secrets are reused:

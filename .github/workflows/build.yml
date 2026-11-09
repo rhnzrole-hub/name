@@ -1,7 +1,7 @@
 name: Build Telegram Plus APK
 on:
   push:
-    branches: [main]
+    branches: [main, build/telegram-plus-7292-final]
     paths:
       - changes.patch
       - .github/workflows/build.yml
@@ -87,7 +87,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: telegram-plus-13.2.1-10accounts-apk
+          name: telegram-plus-13.2.1-final-apk
           path: source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk
           if-no-files-found: error
       - name: Remove signing material
