@@ -1,3 +1,49 @@
+diff --git a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+index edab4e2c..d00397e6 100644
+--- a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
++++ b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+@@ -152,9 +152,27 @@ ConnectionsManager& ConnectionsManager::getInstance(int32_t instanceNum) {
+             static ConnectionsManager instance3(3);
+             return instance3;
+         case 4:
+-        default:
+             static ConnectionsManager instance4(4);
+             return instance4;
++        case 5:
++            static ConnectionsManager instance5(5);
++            return instance5;
++        case 6:
++            static ConnectionsManager instance6(6);
++            return instance6;
++        case 7:
++            static ConnectionsManager instance7(7);
++            return instance7;
++        case 8:
++            static ConnectionsManager instance8(8);
++            return instance8;
++        case 9:
++            static ConnectionsManager instance9(9);
++            return instance9;
++        case 10:
++        default:
++            static ConnectionsManager instance10(10);
++            return instance10;
+     }
+ }
+ 
+diff --git a/TMessagesProj/jni/tgnet/Defines.h b/TMessagesProj/jni/tgnet/Defines.h
+index 19b75915..9bc75df5 100644
+--- a/TMessagesProj/jni/tgnet/Defines.h
++++ b/TMessagesProj/jni/tgnet/Defines.h
+@@ -28,7 +28,7 @@
+ #define DOWNLOAD_CONNECTIONS_COUNT 8
+ #define UPLOAD_CONNECTIONS_COUNT 8
+ #define CONNECTION_BACKGROUND_KEEP_TIME 10000
+-#define MAX_ACCOUNT_COUNT 5
++#define MAX_ACCOUNT_COUNT 11
+ #define USE_DELEGATE_HOST_RESOLVE
+ 
+ #define USE_IPV4_ONLY 0
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java b/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
 index 3a5413ce..6a358ded 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
@@ -650,6 +696,37 @@ index 85ab1d8a..a6e8a160 100644
          editor.putInt("repeatMode", repeatMode);
          editor.apply();
      }
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
+index 3abf7992..072a912f 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
+@@ -26,7 +26,12 @@ public class UserConfig extends BaseController {
+ 
+     public static int selectedAccount;
+     public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;
+-    public final static int MAX_ACCOUNT_COUNT = 4;
++    // Preserve account slots used by earlier builds when installing an update.
++    public final static int MAX_ACCOUNT_COUNT = 10;
++
++    public static int normalizeStoredAccount(int account) {
++        return account >= 0 && account < MAX_ACCOUNT_COUNT ? account : 0;
++    }
+ 
+     private final Object sync = new Object();
+     private volatile boolean configLoaded;
+@@ -296,7 +301,11 @@ public class UserConfig extends BaseController {
+             }
+             SharedPreferences preferences = getPreferences();
+             if (currentAccount == 0) {
+-                selectedAccount = preferences.getInt("selectedAccount", 0);
++                int storedAccount = preferences.getInt("selectedAccount", 0);
++                selectedAccount = normalizeStoredAccount(storedAccount);
++                if (storedAccount != selectedAccount) {
++                    preferences.edit().putInt("selectedAccount", selectedAccount).apply();
++                }
+             }
+             registeredForPush = preferences.getBoolean("registeredForPush", false);
+             lastSendMessageId = preferences.getInt("lastSendMessageId", -210000);
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java b/TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java
 index c9dce56d..1397b953 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java
@@ -8460,7 +8537,7 @@ index 9f56ca61..e5409396 100644
 +    <string name="StopAfterCurrentAudio" translatable="false">Stop after current audio</string>
  </resources>
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..09a4007a 100644
+index 574e3b80..4bdf12f5 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -8468,7 +8545,7 @@ index 574e3b80..09a4007a 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7293
++APP_VERSION_CODE=7294
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false
