@@ -1,0 +1,105 @@
+name: Build EchoGram APK
+on:
+  push:
+    branches: [build/echogram-13.2.1-7293]
+    paths:
+      - changes.patch
+      - .github/workflows/build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: echogram-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required secrets
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          for name in API_ID API_HASH KEYSTORE KEY_ALIAS KEY_PASSWORD STORE_PASSWORD; do
+            if [ -z "${!name}" ]; then echo "Missing required secret: $name"; exit 1; fi
+          done
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android tools
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Fetch source and apply changes
+        run: |
+          git init source
+          git -C source remote add origin https://github.com/DrKLO/Telegram.git
+          git -C source fetch --depth 1 origin 7be672ead283d022812d75c729d3a04dd4c2a2c6
+          git -C source checkout --detach FETCH_HEAD
+          git -C source submodule update --init --recursive --depth 1 --jobs 4
+          git -C source apply --check "$GITHUB_WORKSPACE/changes.patch"
+          git -C source apply "$GITHUB_WORKSPACE/changes.patch"
+      - name: Configure credentials
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > source/TMessagesProj/config/release.keystore
+          python3 - <<'PY'
+          import os, pathlib, re
+          p = pathlib.Path('source/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java')
+          s = p.read_text()
+          api_id, api_hash = os.environ['API_ID'], os.environ['API_HASH']
+          if not api_id.isdigit() or not re.fullmatch(r'[0-9a-fA-F]{32}', api_hash):
+              raise SystemExit('Invalid API ID or API hash')
+          s, id_count = re.subn(r'public static int APP_ID = \d+;', 'public static int APP_ID = ' + api_id + ';', s)
+          s, hash_count = re.subn(r'public static String APP_HASH = "[^"]*";', 'public static String APP_HASH = "' + api_hash + '";', s)
+          if id_count != 1 or hash_count != 1:
+              raise SystemExit('Could not configure upstream Telegram API fields')
+          s = s.replace('public static boolean SUPPORTS_PASSKEYS = true;', 'public static boolean SUPPORTS_PASSKEYS = false;')
+          p.write_text(s)
+          PY
+      - name: Build APK
+        working-directory: source
+        env:
+          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon --max-workers=2 --stacktrace '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g' "-PRELEASE_KEY_ALIAS=$ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD"
+      - name: Verify signed APK
+        run: |
+          for apk in source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk; do
+            "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          done
+      - name: Name EchoGram APK
+        run: |
+          mkdir -p dist
+          python3 - <<'PYAPK'
+          import pathlib, shutil
+          apks = list(pathlib.Path('source/TMessagesProj_App/build/outputs/apk/afat/debug').glob('*.apk'))
+          if len(apks) != 1:
+              raise SystemExit('Expected one universal APK, got ' + str(len(apks)))
+          shutil.copy2(apks[0], 'dist/EchoGram-13.2.1.apk')
+          PYAPK
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EchoGram-13.2.1-APK
+          path: dist/EchoGram-13.2.1.apk
+          if-no-files-found: error
+      - name: Remove signing material
+        if: always()
+        run: rm -f source/TMessagesProj/config/release.keystore
