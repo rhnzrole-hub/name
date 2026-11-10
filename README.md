@@ -1,6 +1,6 @@
 # EchoGram — unofficial Telegram Android build
 
-Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7294**.
+Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7295**.
 
 Current changes:
 - EchoGram name and the supplied blue/purple icon, including adaptive launcher resources.
@@ -10,11 +10,13 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7294-startup-fix` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7295-media-retention` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
-After a successful run, download **EchoGram-13.2.1-7294-APK**, then extract **EchoGram-13.2.1.apk**.
+After a successful run, download **EchoGram-13.2.1-7295-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
 
 Local checks cover retention, account isolation, storage-queue ordering, rendering, audio controls, timestamps and launcher resources. Device performance and Android integration still require installing and testing the built APK.
 
 Startup compatibility fix: preserve the ten account storage slots used by earlier Telegram Plus installs, with eleven distinct native connection slots including the reserved slot. Validate a stored selected-account index before it is used during initialization. The default add-account limit is unchanged. No auth data or account databases are deleted or migrated.
+
+Received cloud-chat disappearing photo/document media, including view-once audio/video, is normalized for local retention before display and database insertion. Existing media-expiry tasks skip deletion of received media/file payloads. Outgoing and secret-chat media keep upstream behavior; already expired or unavailable media cannot be recovered. Normal local cache cleanup still applies.

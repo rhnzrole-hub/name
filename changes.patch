@@ -44,6 +44,46 @@ index 19b75915..9bc75df5 100644
  #define USE_DELEGATE_HOST_RESOLVE
  
  #define USE_IPV4_ONLY 0
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java b/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java
+new file mode 100644
+index 00000000..d9bb1bce
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java
+@@ -0,0 +1,34 @@
++package org.telegram.messenger;
++
++import org.telegram.tgnet.TLRPC;
++
++/** Keep received cloud-chat media locally; outgoing and secret-chat media are unchanged. */
++public final class ExpiringMediaRetention {
++    private ExpiringMediaRetention() {}
++
++    public static boolean canKeep(TLRPC.Message message) {
++        if (!(message instanceof TLRPC.TL_message) || message instanceof TLRPC.TL_message_secret
++                || message.out || message.id <= 0 || message.media == null
++                || DialogObject.isEncryptedDialog(MessageObject.getDialogId(message))) {
++            return false;
++        }
++        if (message.media instanceof TLRPC.TL_messageMediaPhoto) {
++            return message.media.photo != null && !(message.media.photo instanceof TLRPC.TL_photoEmpty);
++        }
++        if (message.media instanceof TLRPC.TL_messageMediaDocument) {
++            return message.media.document != null && !(message.media.document instanceof TLRPC.TL_documentEmpty);
++        }
++        return false;
++    }
++
++    public static void normalize(TLRPC.Message message) {
++        if (canKeep(message) && message.media.ttl_seconds > 0) {
++            message.media.ttl_seconds = 0;
++            // Photo and document media both encode ttl_seconds with flag bit 2.
++            message.media.flags &= ~4;
++            message.ttl = 0;
++            message.destroyTime = 0;
++            message.destroyTimeMillis = 0;
++        }
++    }
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java b/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
 index 3a5413ce..6a358ded 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
@@ -180,6 +220,26 @@ index b1e2120a..60cb01bb 100644
                              final boolean restored = restoreMusicPlaylistState();
                              if (!restored) {
                                  if (!playlist.isEmpty() && (playlist.size() > 1 || !messageObject.isVoice())) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java
+index 373e4235..fd022d53 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java
+@@ -2019,6 +2019,7 @@ public class MessageObject {
+         localName = name;
+         localUserName = userName;
+         messageText = formattedMessage;
++        ExpiringMediaRetention.normalize(message);
+         messageOwner = message;
+         localChannel = isChannel;
+         localSupergroup = supergroup;
+@@ -2074,6 +2075,7 @@ public class MessageObject {
+         this.searchType = searchType;
+ 
+         currentAccount = accountNum;
++        ExpiringMediaRetention.normalize(message);
+         messageOwner = message;
+         replyMessageObject = replyToMessage;
+         eventId = eid;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 index 9d0077ff..5f2e1b7e 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
@@ -402,10 +462,24 @@ index 9d0077ff..5f2e1b7e 100644
      }
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-index 07716f34..510f9145 100644
+index 07716f34..dc762760 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-@@ -11582,6 +11582,25 @@ public class MessagesStorage extends BaseController {
+@@ -4877,6 +4877,13 @@ public class MessagesStorage extends BaseController {
+                         TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                         message.readAttachPath(data, getUserConfig().clientUserId);
+                         data.reuse();
++                        if (ExpiringMediaRetention.canKeep(message)) {
++                            ArrayList<Integer> retainedIds = new ArrayList<>();
++                            retainedIds.add(message.id);
++                            long channelId = message.peer_id == null ? 0 : message.peer_id.channel_id;
++                            RetainedMessages.record(currentAccount, channelId, retainedIds);
++                            continue;
++                        }
+                         if (message.media != null) {
+                             if (!addFilesToDelete(message, filesToDelete, idsToDelete, namesToDelete, true)) {
+                                 continue;
+@@ -11582,6 +11589,25 @@ public class MessagesStorage extends BaseController {
          });
      }
  
@@ -431,7 +505,7 @@ index 07716f34..510f9145 100644
      public void overwriteChannel(long channelId, TLRPC.TL_updates_channelDifferenceTooLong difference, int newDialogType, Runnable onDone) {
          storageQueue.postRunnable(() -> {
              SQLiteCursor cursor = null;
-@@ -11601,21 +11620,22 @@ public class MessagesStorage extends BaseController {
+@@ -11601,21 +11627,22 @@ public class MessagesStorage extends BaseController {
                  cursor.dispose();
                  cursor = null;
  
@@ -458,6 +532,14 @@ index 07716f34..510f9145 100644
                  database.executeFast("DELETE FROM messages_holes_topics WHERE uid = " + did).stepThis().dispose();
  
                  getMediaDataController().clearBotKeyboard(did);
+@@ -12045,6 +12072,7 @@ public class MessagesStorage extends BaseController {
+         if (messages != null) {
+             ArrayList<TL_ephemeral.EphemeralMessage> ephemeralMessages = null;
+             for (TLRPC.Message message : messages) {
++                ExpiringMediaRetention.normalize(message);
+                 if (MessageObject.isEphemeralAndNotWelcome(message) && message.id > 0) {
+                     final int topicId = (int) MessageObject.getTopicId(currentAccount, message, getForumTypeFlags(message.dialog_id));
+                     if (ephemeralMessages == null) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java b/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java
 index 4f18f46f..1d87a02f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java
@@ -8537,7 +8619,7 @@ index 9f56ca61..e5409396 100644
 +    <string name="StopAfterCurrentAudio" translatable="false">Stop after current audio</string>
  </resources>
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..4bdf12f5 100644
+index 574e3b80..00a8d594 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -8545,7 +8627,7 @@ index 574e3b80..4bdf12f5 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7294
++APP_VERSION_CODE=7295
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false
