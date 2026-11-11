@@ -1,6 +1,6 @@
 # EchoGram — unofficial Telegram Android build
 
-Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7295**.
+Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7296**.
 
 Current changes:
 - EchoGram name and the supplied blue/purple icon, including adaptive launcher resources.
@@ -10,9 +10,9 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7295-media-retention` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7296` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
-After a successful run, download **EchoGram-13.2.1-7295-APK**, then extract **EchoGram-13.2.1.apk**.
+After a successful run, download **EchoGram-13.2.1-7296-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
 
 Local checks cover retention, account isolation, storage-queue ordering, rendering, audio controls, timestamps and launcher resources. Device performance and Android integration still require installing and testing the built APK.
@@ -20,3 +20,13 @@ Local checks cover retention, account isolation, storage-queue ordering, renderi
 Startup compatibility fix: preserve the ten account storage slots used by earlier Telegram Plus installs, with eleven distinct native connection slots including the reserved slot. Validate a stored selected-account index before it is used during initialization. The default add-account limit is unchanged. No auth data or account databases are deleted or migrated.
 
 Received cloud-chat disappearing photo/document media, including view-once audio/video, is normalized for local retention before display and database insertion. Existing media-expiry tasks skip deletion of received media/file payloads. Outgoing and secret-chat media keep upstream behavior; already expired or unavailable media cannot be recovered. Normal local cache cleanup still applies.
+
+Join-link preview sheets show Telegram-provided subscriber/member totals below the title before joining. Known invite/full-chat totals are reused; missing totals may be fetched once using the existing chat access details, with the request cancelled on dismissal. Unknown totals stay hidden, and viewing the count never joins the chat.
+
+Edited-message history is stored in an indexed per-account SQLite table before cached content is replaced. Received live edits and later history refreshes preserve available prior text/caption versions; formatting changes are fingerprinted too. The one-tap message menu exposes **Edits history**, with 50-version keyset pages and individual full-text views. Local media edits snapshot the previous cached version before optimistic replacement. Explicit local message deletion or dialog-history clearing removes associated history. Older media file bytes are not separately archived, and unseen versions cannot be recovered. No SQL runs while drawing messages or constructing the context menu.
+
+Retained remotely deleted messages also show a small trash icon inline with the timestamp. A cached, paint-tinted vector span reserves its width in time/bubble measurement. Visible cells rebind only when their retained-deletion marker changes; fading remains enabled and normal messages do not show the icon.
+
+**Burn media** is available in the message menu for downloaded received disappearing media with a known original TTL. Original TTL and acknowledged Burn state are stored in local-only message custom params (high flags, version-1 compatible). The explicit action sends Telegram read-content receipts, checks acknowledgement, preserves local file payloads, suppresses duplicate in-flight requests and permits retry on failure. Sender expiry follows Telegram and the original timer; no server-side forced-expiry or local delete request is sent. Media normalized by older builds may lack its original TTL marker until Telegram supplies the original media metadata again.
+
+Review before the next build: member-count requests now use the sheet account for message-based access and cancel only after dismissal is accepted; Burn result bulletins are suppressed after account changes. The existing update-compatible build variant keeps its package and signing configuration but disables debuggable/JNI-debug flags and default private/debug diagnostic mode. No new Android APK/device profile was produced during this review. Java syntax, resource references, storage/history pagination, Burn acknowledgement/params compatibility, retention rendering and native account-slot regression checks passed locally.

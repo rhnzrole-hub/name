@@ -1,3 +1,25 @@
+diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
+index ada7f85b..12aac21c 100644
+--- a/TMessagesProj/build.gradle
++++ b/TMessagesProj/build.gradle
+@@ -158,14 +158,14 @@ android {
+ 
+     buildTypes {
+         debug {
+-            jniDebuggable true
++            jniDebuggable false
+             shrinkResources false
+             multiDexEnabled true
+             ndk.debugSymbolLevel = 'FULL'
+             buildConfigField "String", "BUILD_VERSION_STRING", "\"" + APP_VERSION_NAME + "\""
+             buildConfigField "String", "BETA_URL", "\"" + getProps("BETA_PRIVATE_URL") + "\""
+-            buildConfigField "boolean", "DEBUG_VERSION", "true"
+-            buildConfigField "boolean", "DEBUG_PRIVATE_VERSION", "true"
++            buildConfigField "boolean", "DEBUG_VERSION", "false"
++            buildConfigField "boolean", "DEBUG_PRIVATE_VERSION", "false"
+             buildConfigField "boolean", "BUNDLE", "false"
+             buildConfigField "int", "VERSION_NUM", "0"
+         }
 diff --git a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
 index edab4e2c..d00397e6 100644
 --- a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
@@ -46,10 +68,10 @@ index 19b75915..9bc75df5 100644
  #define USE_IPV4_ONLY 0
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java b/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java
 new file mode 100644
-index 00000000..d9bb1bce
+index 00000000..891a865c
 --- /dev/null
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,39 @@
 +package org.telegram.messenger;
 +
 +import org.telegram.tgnet.TLRPC;
@@ -73,8 +95,13 @@ index 00000000..d9bb1bce
 +        return false;
 +    }
 +
++    public static boolean canBurn(TLRPC.Message message) {
++        return canKeep(message) && message.retainedMediaTtl > 0 && !message.retainedMediaBurned;
++    }
++
 +    public static void normalize(TLRPC.Message message) {
 +        if (canKeep(message) && message.media.ttl_seconds > 0) {
++            if (message.retainedMediaTtl <= 0) message.retainedMediaTtl = message.media.ttl_seconds;
 +            message.media.ttl_seconds = 0;
 +            // Photo and document media both encode ttl_seconds with flag bit 2.
 +            message.media.flags &= ~4;
@@ -220,6 +247,130 @@ index b1e2120a..60cb01bb 100644
                              final boolean restored = restoreMusicPlaylistState();
                              if (!restored) {
                                  if (!playlist.isEmpty() && (playlist.size() > 1 || !messageObject.isVoice())) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessageCustomParamsHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessageCustomParamsHelper.java
+index b233d8e3..70ab0ed4 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessageCustomParamsHelper.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessageCustomParamsHelper.java
+@@ -16,6 +16,7 @@ public class MessageCustomParamsHelper {
+ 
+     public static boolean isEmpty(TLRPC.Message message) {
+         return (
++            message.retainedMediaTtl == 0 && !message.retainedMediaBurned &&
+             !isCommentEncryptionPreparing(message) &&
+             message.voiceTranscription == null &&
+             message.translatedVoiceTranscription == null &&
+@@ -40,6 +41,8 @@ public class MessageCustomParamsHelper {
+     }
+ 
+     public static void copyParams(TLRPC.Message fromMessage, TLRPC.Message toMessage) {
++        if (fromMessage.retainedMediaTtl > 0) toMessage.retainedMediaTtl = fromMessage.retainedMediaTtl;
++        toMessage.retainedMediaBurned |= fromMessage.retainedMediaBurned;
+         toMessage.voiceTranscription = fromMessage.voiceTranscription;
+         toMessage.voiceTranscriptionOpen = fromMessage.voiceTranscriptionOpen;
+         toMessage.voiceTranscriptionFinal = fromMessage.voiceTranscriptionFinal;
+@@ -121,6 +124,9 @@ public class MessageCustomParamsHelper {
+ 
+             flags = setFlag(flags, FLAG_13, message.translatedRichMessage != null);
+             flags = setFlag(flags, FLAG_14, isCommentEncryptionPreparing(message));
++            // EchoGram local extensions use the high flag bits.
++            flags = setFlag(flags, FLAG_30, message.retainedMediaTtl > 0);
++            flags = setFlag(flags, FLAG_31, message.retainedMediaBurned);
+         }
+ 
+         @Override
+@@ -173,6 +179,9 @@ public class MessageCustomParamsHelper {
+             if (hasFlag(flags, FLAG_13)) {
+                 message.translatedRichMessage.serializeToStream(stream);
+             }
++            if (hasFlag(flags, FLAG_30)) {
++                stream.writeInt32(message.retainedMediaTtl);
++            }
+         }
+ 
+         @Override
+@@ -228,6 +237,10 @@ public class MessageCustomParamsHelper {
+             if (hasFlag(flags, FLAG_13)) {
+                 message.translatedRichMessage = TL_iv.RichMessage.TLdeserialize(stream, stream.readInt32(exception), exception);
+             }
++            if (hasFlag(flags, FLAG_30)) {
++                message.retainedMediaTtl = stream.readInt32(exception);
++            }
++            message.retainedMediaBurned |= hasFlag(flags, FLAG_31);
+         }
+ 
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessageEditsHistory.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessageEditsHistory.java
+new file mode 100644
+index 00000000..e0f29a63
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessageEditsHistory.java
+@@ -0,0 +1,66 @@
++package org.telegram.messenger;
++
++import org.telegram.tgnet.SerializedData;
++import org.telegram.tgnet.TLRPC;
++
++import java.security.MessageDigest;
++import java.util.ArrayList;
++
++public final class MessageEditsHistory {
++    public static final int PAGE_SIZE = 50;
++    private MessageEditsHistory() {}
++
++    public static final class Entry {
++        public final long sequence;
++        public final int date;
++        public final boolean original;
++        public final TLRPC.Message message;
++
++        public Entry(long sequence, int date, boolean original, TLRPC.Message message) {
++            this.sequence = sequence;
++            this.date = date;
++            this.original = original;
++            this.message = message;
++        }
++    }
++
++    public static final class Page {
++        public final ArrayList<Entry> entries = new ArrayList<>();
++        public boolean hasMore;
++    }
++
++    public static boolean canRecord(TLRPC.Message before, TLRPC.Message after) {
++        return before instanceof TLRPC.TL_message && after instanceof TLRPC.TL_message
++                && !(before instanceof TLRPC.TL_message_secret) && !(after instanceof TLRPC.TL_message_secret)
++                && before.id > 0 && before.id == after.id
++                && MessageObject.getDialogId(before) != 0
++                && MessageObject.getDialogId(before) == MessageObject.getDialogId(after)
++                && !DialogObject.isEncryptedDialog(MessageObject.getDialogId(before));
++    }
++
++    /** Content only: read state, counters, reactions and edit timestamps cannot create duplicates. */
++    public static String contentKey(TLRPC.Message message) {
++        SerializedData data = new SerializedData();
++        try {
++            data.writeString(message.message == null ? "" : message.message);
++            data.writeInt32(message.entities == null ? 0 : message.entities.size());
++            if (message.entities != null) {
++                for (TLRPC.MessageEntity entity : message.entities) entity.serializeToStream(data);
++            }
++            boolean hasMedia = message.media != null && !(message.media instanceof TLRPC.TL_messageMediaEmpty);
++            data.writeBool(hasMedia);
++            if (hasMedia) message.media.serializeToStream(data);
++            byte[] digest = MessageDigest.getInstance("SHA-256").digest(data.toByteArray());
++            StringBuilder key = new StringBuilder(64);
++            final char[] hex = "0123456789abcdef".toCharArray();
++            for (byte value : digest) {
++                key.append(hex[(value & 255) >>> 4]).append(hex[value & 15]);
++            }
++            return key.toString();
++        } catch (java.security.NoSuchAlgorithmException e) {
++            throw new IllegalStateException(e);
++        } finally {
++            data.cleanup();
++        }
++    }
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java
 index 373e4235..fd022d53 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java
@@ -241,7 +392,7 @@ index 373e4235..fd022d53 100644
          replyMessageObject = replyToMessage;
          eventId = eid;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
-index 9d0077ff..5f2e1b7e 100644
+index 9d0077ff..8c0bb28f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 @@ -6423,6 +6423,7 @@ public class MessagesController extends BaseController implements NotificationCe
@@ -252,17 +403,90 @@ index 9d0077ff..5f2e1b7e 100644
          getContactsController().cleanup();
          MediaController.getInstance().cleanup();
          getNotificationsController().cleanup();
-@@ -9370,6 +9371,9 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -9370,6 +9371,10 @@ public class MessagesController extends BaseController implements NotificationCe
                      }
                  }
              }
 +            if (!scheduled && !quickReplies && !welcomeMessages) {
 +                RetainedMessages.forget(currentAccount, channelId, messages);
++                getMessagesStorage().deleteMessageEditsHistory(dialogId, messages);
 +            }
              if (scheduled) {
                  getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, false, ChatActivity.MODE_SCHEDULED, 0);
              } else if (quickReplies) {
-@@ -17634,35 +17638,11 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -14511,6 +14516,71 @@ public class MessagesController extends BaseController implements NotificationCe
+         getMessagesStorage().emptyMessagesMedia(dialogId, mids);
+     }
+ 
++    private final ConcurrentHashMap<String, Boolean> burningRetainedMedia = new ConcurrentHashMap<>();
++
++    public void burnRetainedMedia(MessageObject object, Utilities.Callback<Boolean> callback) {
++        if (object == null || object.currentAccount != currentAccount || object.scheduled
++                || object.isQuickReply() || object.isWelcomeMessage()
++                || (!object.mediaExists && !object.attachPathExists)
++                || !ExpiringMediaRetention.canBurn(object.messageOwner)) {
++            callback.run(false);
++            return;
++        }
++        final long did = object.getDialogId();
++        final int mid = object.getId();
++        final long userId = getUserConfig().getClientUserId();
++        if (userId == 0) {
++            callback.run(false);
++            return;
++        }
++        final long channelId = object.messageOwner.peer_id == null ? 0 : object.messageOwner.peer_id.channel_id;
++        TLObject request;
++        if (channelId != 0) {
++            TLRPC.InputChannel channel = getInputChannel(channelId);
++            if (channel == null) {
++                callback.run(false);
++                return;
++            }
++            TLRPC.TL_channels_readMessageContents req = new TLRPC.TL_channels_readMessageContents();
++            req.channel = channel;
++            req.id.add(mid);
++            request = req;
++        } else {
++            TLRPC.TL_messages_readMessageContents req = new TLRPC.TL_messages_readMessageContents();
++            req.id.add(mid);
++            request = req;
++        }
++        final String key = did + ":" + mid;
++        if (burningRetainedMedia.putIfAbsent(key, true) != null) {
++            callback.run(false);
++            return;
++        }
++        getConnectionsManager().sendRequest(request, (response, error) -> {
++            boolean acknowledged = error == null && (response instanceof TLRPC.TL_messages_affectedMessages
++                    || response instanceof TLRPC.TL_boolTrue);
++            if (acknowledged && getUserConfig().getClientUserId() == userId && response instanceof TLRPC.TL_messages_affectedMessages) {
++                TLRPC.TL_messages_affectedMessages result = (TLRPC.TL_messages_affectedMessages) response;
++                processNewDifferenceParams(-1, result.pts, -1, result.pts_count);
++            }
++            AndroidUtilities.runOnUIThread(() -> {
++                burningRetainedMedia.remove(key);
++                if (!acknowledged || getUserConfig().getClientUserId() != userId) {
++                    callback.run(false);
++                    return;
++                }
++                object.messageOwner.retainedMediaBurned = true;
++                object.setContentIsRead();
++                ArrayList<Integer> ids = new ArrayList<>();
++                ids.add(mid);
++                getMessagesStorage().markMessagesContentAsRead(did, ids, 0, 0);
++                getMessagesStorage().updateMessageCustomParams(did, object.messageOwner);
++                RetainedMessages.record(currentAccount, channelId, ids);
++                getNotificationCenter().postNotificationName(NotificationCenter.messagesReadContent, did, ids);
++                callback.run(true);
++            });
++        });
++    }
++
+     public void markMessageAsRead2(long dialogId, int mid, TLRPC.InputChannel inputChannel, int ttl, long taskId) {
+         markMessageAsRead2(dialogId, mid, inputChannel, ttl, taskId, true);
+     }
+@@ -17634,35 +17704,11 @@ public class MessagesController extends BaseController implements NotificationCe
      }
  
      protected void deleteMessagesByPush(long dialogId, ArrayList<Integer> ids, long channelId) {
@@ -303,7 +527,7 @@ index 9d0077ff..5f2e1b7e 100644
          });
      }
  
-@@ -18894,15 +18874,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -18894,15 +18940,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  dialogs_read_outbox_max.put(dialogId, Math.max(value, update.max_id));
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteMessages) {
                  TL_update.TL_updateDeleteMessages update = (TL_update.TL_updateDeleteMessages) baseUpdate;
@@ -320,7 +544,7 @@ index 9d0077ff..5f2e1b7e 100644
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteQuickReplyMessages) {
                  TL_update.TL_updateDeleteQuickReplyMessages update = (TL_update.TL_updateDeleteQuickReplyMessages) baseUpdate;
                  if (deletedQuickReplyMessages == null) {
-@@ -19420,19 +19392,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19420,19 +19458,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  dialogs_read_outbox_max.put(dialogId, Math.max(value, update.max_id));
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteChannelMessages) {
                  TL_update.TL_updateDeleteChannelMessages update = (TL_update.TL_updateDeleteChannelMessages) baseUpdate;
@@ -341,7 +565,7 @@ index 9d0077ff..5f2e1b7e 100644
              } else if (baseUpdate instanceof TL_update.TL_updateChannel) {
                  if (BuildVars.LOGS_ENABLED) {
                      TL_update.TL_updateChannel update = (TL_update.TL_updateChannel) baseUpdate;
-@@ -19625,14 +19585,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19625,14 +19651,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  AndroidUtilities.runOnUIThread(() -> LocaleController.getInstance().reloadCurrentRemoteLocale(currentAccount, update.lang_code, false, null));
              } else if (baseUpdate instanceof TL_update.TL_updateChannelAvailableMessages) {
                  TL_update.TL_updateChannelAvailableMessages update = (TL_update.TL_updateChannelAvailableMessages) baseUpdate;
@@ -357,7 +581,7 @@ index 9d0077ff..5f2e1b7e 100644
              } else if (baseUpdate instanceof TL_update.TL_updateMessagePoll) {
                  TL_update.TL_updateMessagePoll update = (TL_update.TL_updateMessagePoll) baseUpdate;
                  if (update.peer != null && update.results != null && update.msg_id != 0) {
-@@ -21724,101 +21677,8 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -21724,101 +21743,8 @@ public class MessagesController extends BaseController implements NotificationCe
      }
  
      public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {
@@ -462,10 +686,197 @@ index 9d0077ff..5f2e1b7e 100644
      }
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-index 07716f34..dc762760 100644
+index 07716f34..550ffb5e 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-@@ -4877,6 +4877,13 @@ public class MessagesStorage extends BaseController {
+@@ -292,7 +292,171 @@ public class MessagesStorage extends BaseController {
+         return size;
+     }
+ 
++    private boolean messageEditsHistoryReady;
++
++    private void ensureMessageEditsHistory() throws Exception {
++        if (messageEditsHistoryReady) return;
++        database.executeFast("CREATE TABLE IF NOT EXISTS message_edit_history(seq INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL, mid INTEGER NOT NULL, changed_at INTEGER NOT NULL, original INTEGER NOT NULL, content_key TEXT NOT NULL, data BLOB NOT NULL)").stepThis().dispose();
++        database.executeFast("CREATE INDEX IF NOT EXISTS message_edit_history_idx ON message_edit_history(uid, mid, seq)").stepThis().dispose();
++        messageEditsHistoryReady = true;
++    }
++
++    // Runs within the existing edit/update transaction on the storage queue.
++    private void recordMessageEdit(TLRPC.Message before, TLRPC.Message after) {
++        if (!MessageEditsHistory.canRecord(before, after)) return;
++        SQLiteCursor cursor = null;
++        try {
++            ExpiringMediaRetention.normalize(before);
++            ExpiringMediaRetention.normalize(after);
++            String beforeKey = MessageEditsHistory.contentKey(before);
++            String afterKey = MessageEditsHistory.contentKey(after);
++            if (beforeKey.equals(afterKey)) return;
++            ensureMessageEditsHistory();
++            long did = MessageObject.getDialogId(after);
++            String lastKey = null;
++            cursor = database.queryFinalized("SELECT content_key FROM message_edit_history WHERE uid = " + did + " AND mid = " + after.id + " ORDER BY seq DESC LIMIT 1");
++            if (cursor.next()) lastKey = cursor.stringValue(0);
++            cursor.dispose();
++            cursor = null;
++            if (!beforeKey.equals(lastKey)) insertMessageEditVersion(did, before, beforeKey);
++            insertMessageEditVersion(did, after, afterKey);
++        } catch (Exception e) {
++            checkSQLException(e);
++        } finally {
++            if (cursor != null) cursor.dispose();
++        }
++    }
++
++    // Called on the storage queue before replacing a cached edited message.
++    private void recordExistingEditedMessage(TLRPC.Message message) {
++        if (!(message instanceof TLRPC.TL_message) || message.out || message.id <= 0 || message.edit_date <= 0
++                || DialogObject.isEncryptedDialog(MessageObject.getDialogId(message))) return;
++        SQLiteCursor cursor = null;
++        try {
++            cursor = database.queryFinalized("SELECT data FROM messages_v2 WHERE uid = " + MessageObject.getDialogId(message) + " AND mid = " + message.id);
++            if (cursor.next()) {
++                NativeByteBuffer data = cursor.byteBufferValue(0);
++                if (data != null) {
++                    try {
++                        TLRPC.Message before = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
++                        if (before != null) {
++                            before.readAttachPath(data, getUserConfig().clientUserId);
++                            recordMessageEdit(before, message);
++                        }
++                    } finally {
++                        data.reuse();
++                    }
++                }
++            }
++        } catch (Exception e) {
++            checkSQLException(e);
++        } finally {
++            if (cursor != null) cursor.dispose();
++        }
++    }
++
++    public void recordMessageBeforeLocalEdit(long did, int mid) {
++        if (mid <= 0 || DialogObject.isEncryptedDialog(did)) return;
++        storageQueue.postRunnable(() -> {
++            SQLiteCursor cursor = null;
++            try {
++                ensureMessageEditsHistory();
++                cursor = database.queryFinalized("SELECT data FROM messages_v2 WHERE uid = " + did + " AND mid = " + mid);
++                if (!cursor.next()) return;
++                NativeByteBuffer data = cursor.byteBufferValue(0);
++                if (data == null) return;
++                TLRPC.Message message;
++                try {
++                    message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
++                    if (message == null) return;
++                    message.readAttachPath(data, getUserConfig().clientUserId);
++                } finally {
++                    data.reuse();
++                }
++                cursor.dispose();
++                cursor = null;
++                if (!MessageEditsHistory.canRecord(message, message)) return;
++                String key = MessageEditsHistory.contentKey(message);
++                cursor = database.queryFinalized("SELECT content_key FROM message_edit_history WHERE uid = " + did + " AND mid = " + mid + " ORDER BY seq DESC LIMIT 1");
++                if (!cursor.next() || !key.equals(cursor.stringValue(0))) insertMessageEditVersion(did, message, key);
++            } catch (Exception e) {
++                checkSQLException(e);
++            } finally {
++                if (cursor != null) cursor.dispose();
++            }
++        });
++    }
++
++    private void insertMessageEditVersion(long did, TLRPC.Message message, String contentKey) throws Exception {
++        NativeByteBuffer data = null;
++        SQLitePreparedStatement statement = null;
++        try {
++            data = new NativeByteBuffer(message.getObjectSize());
++            message.serializeToStream(data);
++            statement = database.executeFast("INSERT INTO message_edit_history(uid, mid, changed_at, original, content_key, data) VALUES(?, ?, ?, ?, ?, ?)");
++            statement.bindLong(1, did);
++            statement.bindInteger(2, message.id);
++            statement.bindInteger(3, message.edit_date > 0 ? message.edit_date : message.date);
++            statement.bindInteger(4, message.edit_date > 0 ? 0 : 1);
++            statement.bindString(5, contentKey);
++            statement.bindByteBuffer(6, data);
++            statement.step();
++        } finally {
++            if (statement != null) statement.dispose();
++            if (data != null) data.reuse();
++        }
++    }
++
++    public void loadMessageEditsHistory(long did, int mid, long beforeSequence, Utilities.Callback<MessageEditsHistory.Page> callback) {
++        storageQueue.postRunnable(() -> {
++            MessageEditsHistory.Page page = new MessageEditsHistory.Page();
++            SQLiteCursor cursor = null;
++            try {
++                ensureMessageEditsHistory();
++                cursor = database.queryFinalized("SELECT seq, changed_at, original, data FROM message_edit_history WHERE uid = " + did + " AND mid = " + mid
++                        + (beforeSequence > 0 ? " AND seq < " + beforeSequence : "") + " ORDER BY seq DESC LIMIT " + (MessageEditsHistory.PAGE_SIZE + 1));
++                while (cursor.next()) {
++                    if (page.entries.size() == MessageEditsHistory.PAGE_SIZE) {
++                        page.hasMore = true;
++                        break;
++                    }
++                    NativeByteBuffer data = cursor.byteBufferValue(3);
++                    if (data == null) continue;
++                    try {
++                        TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
++                        if (message != null) {
++                            message.dialog_id = did;
++                            message.readAttachPath(data, getUserConfig().clientUserId);
++                            page.entries.add(new MessageEditsHistory.Entry(cursor.longValue(0), cursor.intValue(1), cursor.intValue(2) != 0, message));
++                        }
++                    } finally {
++                        data.reuse();
++                    }
++                }
++            } catch (Exception e) {
++                checkSQLException(e);
++            } finally {
++                if (cursor != null) cursor.dispose();
++            }
++            AndroidUtilities.runOnUIThread(() -> callback.run(page));
++        });
++    }
++
++    public void deleteMessageEditsHistory(long did, ArrayList<Integer> mids) {
++        if (mids == null || mids.isEmpty()) return;
++        ArrayList<Integer> ids = new ArrayList<>(mids);
++        storageQueue.postRunnable(() -> {
++            try {
++                ensureMessageEditsHistory();
++                database.executeFast("DELETE FROM message_edit_history WHERE uid = " + did + " AND mid IN (" + TextUtils.join(",", ids) + ")").stepThis().dispose();
++            } catch (Exception e) {
++                checkSQLException(e);
++            }
++        });
++    }
++
+     public void openDatabase(int openTries) {
++        messageEditsHistoryReady = false;
+         if (!NativeLoader.loaded()) {
+             int tryCount = 0;
+             while (!NativeLoader.loaded()) {
+@@ -4525,6 +4689,14 @@ public class MessagesStorage extends BaseController {
+             SQLitePreparedStatement state5 = null;
+             SQLitePreparedStatement state6 = null;
+             try {
++                if (messagesOnly == 0 || messagesOnly == 1) {
++                    try {
++                        ensureMessageEditsHistory();
++                        database.executeFast("DELETE FROM message_edit_history WHERE uid = " + did).stepThis().dispose();
++                    } catch (Exception e) {
++                        checkSQLException(e);
++                    }
++                }
+                 if (messagesOnly == 3) {
+                     int lastMid = -1;
+                     cursor = database.queryFinalized("SELECT last_mid FROM dialogs WHERE did = " + did);
+@@ -4877,6 +5049,13 @@ public class MessagesStorage extends BaseController {
                          TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
                          message.readAttachPath(data, getUserConfig().clientUserId);
                          data.reuse();
@@ -479,7 +890,7 @@ index 07716f34..dc762760 100644
                          if (message.media != null) {
                              if (!addFilesToDelete(message, filesToDelete, idsToDelete, namesToDelete, true)) {
                                  continue;
-@@ -11582,6 +11589,25 @@ public class MessagesStorage extends BaseController {
+@@ -11582,6 +11761,25 @@ public class MessagesStorage extends BaseController {
          });
      }
  
@@ -505,10 +916,11 @@ index 07716f34..dc762760 100644
      public void overwriteChannel(long channelId, TLRPC.TL_updates_channelDifferenceTooLong difference, int newDialogType, Runnable onDone) {
          storageQueue.postRunnable(() -> {
              SQLiteCursor cursor = null;
-@@ -11601,21 +11627,22 @@ public class MessagesStorage extends BaseController {
+@@ -11601,21 +11799,23 @@ public class MessagesStorage extends BaseController {
                  cursor.dispose();
                  cursor = null;
  
++                for (TLRPC.Message message : difference.messages) recordExistingEditedMessage(message);
 +                final String keepRetainedMessages = RetainedMessages.keepDeletedSql(currentAccount, channelId);
                  database.executeFast("DELETE FROM chat_pinned_count WHERE uid = " + did).stepThis().dispose();
                  database.executeFast("DELETE FROM chat_pinned_v2 WHERE uid = " + did).stepThis().dispose();
@@ -532,14 +944,44 @@ index 07716f34..dc762760 100644
                  database.executeFast("DELETE FROM messages_holes_topics WHERE uid = " + did).stepThis().dispose();
  
                  getMediaDataController().clearBotKeyboard(did);
-@@ -12045,6 +12072,7 @@ public class MessagesStorage extends BaseController {
+@@ -12045,6 +12245,8 @@ public class MessagesStorage extends BaseController {
          if (messages != null) {
              ArrayList<TL_ephemeral.EphemeralMessage> ephemeralMessages = null;
              for (TLRPC.Message message : messages) {
 +                ExpiringMediaRetention.normalize(message);
++                if (mode == ChatActivity.MODE_DEFAULT) recordExistingEditedMessage(message);
                  if (MessageObject.isEphemeralAndNotWelcome(message) && message.id > 0) {
                      final int topicId = (int) MessageObject.getTopicId(currentAccount, message, getForumTypeFlags(message.dialog_id));
                      if (ephemeralMessages == null) {
+@@ -16273,7 +16475,18 @@ public class MessagesStorage extends BaseController {
+             SQLitePreparedStatement state_tasks = null;
+             SQLitePreparedStatement state3 = null;
+             SQLiteCursor cursor = null;
++            // Create the history schema before the existing edit transaction can begin.
++            if (load_type == -2 && mode == ChatActivity.MODE_DEFAULT) {
++                try {
++                    ensureMessageEditsHistory();
++                } catch (Exception e) {
++                    checkSQLException(e);
++                }
++            }
+             try {
++                if (load_type != -2 && mode == ChatActivity.MODE_DEFAULT) {
++                    for (TLRPC.Message message : messages.messages) recordExistingEditedMessage(message);
++                }
+                 final long selfId = getUserConfig().getClientUserId();
+                 final boolean scheduled = mode == ChatActivity.MODE_SCHEDULED;
+                 final boolean quickReplies = mode == ChatActivity.MODE_QUICK_REPLIES;
+@@ -16464,6 +16677,9 @@ public class MessagesStorage extends BaseController {
+                                 if (data != null) {
+                                     TLRPC.Message oldMessage = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                                     oldMessage.readAttachPath(data, getUserConfig().clientUserId);
++                                    if (mode == ChatActivity.MODE_DEFAULT) {
++                                        recordMessageEdit(oldMessage, message);
++                                    }
+                                     data.reuse();
+                                     if (reactionUpdates != null) {
+                                         reactionUpdates.add(new SavedReactionsUpdate(selfId, oldMessage, message));
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java b/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java
 index 4f18f46f..1d87a02f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java
@@ -727,6 +1169,20 @@ index 00000000..115d9d16
 +        });
 +    }
 +}
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
+index 55452d3d..96000447 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
+@@ -3059,6 +3059,9 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+         if (messageObject == null) {
+             return;
+         }
++        if (!messageObject.scheduled && !messageObject.isQuickReply() && !messageObject.isWelcomeMessage()) {
++            getMessagesStorage().recordMessageBeforeLocalEdit(messageObject.getDialogId(), messageObject.getId());
++        }
+         if (params == null) {
+             params = new HashMap<>();
+         }
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
 index 85ab1d8a..a6e8a160 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
@@ -883,8 +1339,21 @@ index c9dce56d..1397b953 100644
      }
  
      private void schedule() {
+diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java b/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
+index 7dfc1008..99d95c96 100644
+--- a/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
++++ b/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
+@@ -59411,6 +59411,8 @@ public class TLRPC {
+         public int local_id = 0; //custom
+         public long dialog_id; //custom
+         public int ttl; //custom
++        public int retainedMediaTtl; //custom, local only; never sent in Telegram messages
++        public boolean retainedMediaBurned; //custom, local only
+         public int destroyTime; //custom
+         public long destroyTimeMillis; //custom
+         public int layer; //custom
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
-index 4f0508f1..26037181 100644
+index 4f0508f1..d42c2572 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 @@ -29,6 +29,8 @@ import android.animation.ValueAnimator;
@@ -896,7 +1365,16 @@ index 4f0508f1..26037181 100644
  import android.content.res.ColorStateList;
  import android.content.res.Configuration;
  import android.graphics.Bitmap;
-@@ -15531,9 +15533,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -1655,6 +1657,8 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+     public int timeX;
+     public int signWidth;
+     CharSequence currentTimeString;
++    private boolean timeShowsRetainedDeletion;
++    private ColoredImageSpan retainedDeletionSpan;
+     boolean drawTime = true;
+     boolean forceNotDrawTime;
+     private Paint drillHolePaint;
+@@ -15531,9 +15535,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
          } else if (current.scheduled && current.messageOwner.date == 0x7FFFFFFE) {
              return "";
          } else if (current.realDate != 0) {
@@ -908,7 +1386,7 @@ index 4f0508f1..26037181 100644
          } else if (edited) {
              if (AppGlobalConfig.getInstance(current.currentAccount).messagePrimaryEditedDate.get()) {
                  if (editDate == 0 && current.isEditing()) {
-@@ -15541,7 +15543,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -15541,7 +15545,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                  }
                  return LocaleController.formatPmEditedDate(editDate);
              }
@@ -917,16 +1395,49 @@ index 4f0508f1..26037181 100644
          } else if (current.isSaved && current.messageOwner.fwd_from != null && (current.messageOwner.fwd_from.date != 0 || current.messageOwner.fwd_from.saved_date != 0)
                  // A widget keeps its time alone in Saved Messages: the pill over its corner stays short.
                  && !(MessageObject.getMedia(current.messageOwner) instanceof TLRPC.TL_messageMediaWidget)) {
-@@ -15551,7 +15553,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -15551,7 +15555,17 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
              }
              return LocaleController.formatSeenDate(date);
          }
 -        return LocaleController.getInstance().getFormatterDay().format((long) (message.messageOwner.date) * 1000);
 +        return LocaleController.getInstance().getFormatterPreciseTime().format((long) (message.messageOwner.date) * 1000);
++    }
++
++    public void refreshRetainedDeletionMarker() {
++        if (currentMessageObject == null) return;
++        if (timeShowsRetainedDeletion != RetainedMessages.isDeleted(currentMessageObject)) {
++            currentMessageObject.forceUpdate = true;
++            setMessageObject(currentMessageObject, getCurrentMessagesGroup(), isPinnedBottom(), isPinnedTop(), isFirstInChat(), isLastInChatList());
++            requestLayout();
++        }
++        invalidate();
      }
  
      void measureTime(MessageObject messageObject) {
-@@ -17288,6 +17290,21 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -15664,7 +15678,21 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+                 currentTimeString = TextUtils.concat(formatString(R.string.MessageScheduledRepeatSeconds, period), ", ", currentTimeString);
+             }
+         }
+-        timeTextWidth = timeWidth = (int) Math.ceil(Theme.chat_timePaint.measureText(currentTimeString, 0, currentTimeString == null ? 0 : currentTimeString.length()));
++        timeShowsRetainedDeletion = RetainedMessages.isDeleted(currentMessageObject);
++        if (timeShowsRetainedDeletion) {
++            if (retainedDeletionSpan == null) {
++                retainedDeletionSpan = new ColoredImageSpan(R.drawable.msg_retained_deleted, ColoredImageSpan.ALIGN_CENTER);
++            }
++            retainedDeletionSpan.setSize(dp(12));
++            retainedDeletionSpan.setWidth(dp(15));
++            SpannableStringBuilder markedTime = new SpannableStringBuilder("\uFFFC");
++            markedTime.setSpan(retainedDeletionSpan, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
++            markedTime.append(currentTimeString);
++            currentTimeString = markedTime;
++        }
++        timeTextWidth = timeWidth = timeShowsRetainedDeletion
++                ? (int) Math.ceil(Layout.getDesiredWidth(currentTimeString, Theme.chat_timePaint))
++                : (int) Math.ceil(Theme.chat_timePaint.measureText(currentTimeString, 0, currentTimeString == null ? 0 : currentTimeString.length()));
+         if (currentMessageObject.scheduled && currentMessageObject.messageOwner.date == 0x7FFFFFFE || currentMessageObject.notime) {
+             timeWidth -= dp(8);
+         }
+@@ -17288,6 +17316,21 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
          drawInternal(canvas);
      }
      public void drawInternal(Canvas canvas) {
@@ -949,10 +1460,19 @@ index 4f0508f1..26037181 100644
              return;
          }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index 1ed161bf..9d52bdb0 100644
+index 1ed161bf..1680a04f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-@@ -2642,6 +2642,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -1240,6 +1240,8 @@ public class ChatActivity extends BaseFragment implements
+     private boolean switchingFromTopics;
+     private float switchingFromTopicsProgress;
+ 
++    public final static int OPTION_BURN_MEDIA = 10002;
++    public final static int OPTION_EDITS_HISTORY = 10001;
+     public final static int OPTION_RETRY = 0;
+     public final static int OPTION_DELETE = 1;
+     public final static int OPTION_FORWARD = 2;
+@@ -2642,6 +2644,7 @@ public class ChatActivity extends BaseFragment implements
  
      @Override
      public boolean onFragmentCreate() {
@@ -960,7 +1480,7 @@ index 1ed161bf..9d52bdb0 100644
          final long chatId = arguments.getLong("chat_id", 0);
          final long userId = arguments.getLong("user_id", 0);
          final int encId = arguments.getInt("enc_id", 0);
-@@ -2900,6 +2901,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -2900,6 +2903,7 @@ public class ChatActivity extends BaseFragment implements
              .add(NotificationCenter.userIsPremiumBlockedUpadted)
              .add(NotificationCenter.didLoadSendAsPeers)
              .add(NotificationCenter.closeChatActivity)
@@ -968,21 +1488,26 @@ index 1ed161bf..9d52bdb0 100644
              .add(NotificationCenter.messagesDeleted)
              .add(NotificationCenter.historyCleared)
              .add(NotificationCenter.messageReceivedByServer)
-@@ -23091,6 +23093,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -23091,6 +23095,18 @@ public class ChatActivity extends BaseFragment implements
              if (updated && chatAdapter != null) {
                  chatAdapter.notifyDataSetChanged(false);
              }
 +        } else if (id == NotificationCenter.retainedMessagesChanged) {
 +            if (chatListView != null) {
 +                for (int i = 0; i < chatListView.getChildCount(); i++) {
-+                    chatListView.getChildAt(i).invalidate();
++                    View child = chatListView.getChildAt(i);
++                    if (child instanceof ChatMessageCell) {
++                        ((ChatMessageCell) child).refreshRetainedDeletionMarker();
++                    } else {
++                        child.invalidate();
++                    }
 +                }
 +                chatListView.invalidate();
 +            }
          } else if (id == NotificationCenter.messagesDeleted) {
              boolean scheduled = (Boolean) args[2];
              if (scheduled != (chatMode == MODE_SCHEDULED)) {
-@@ -25759,55 +25768,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -25759,55 +25775,13 @@ public class ChatActivity extends BaseFragment implements
      private Pattern sponsoredUrlPattern;
      private MessageObject botSponsoredMessage;
      private void addSponsoredMessages(boolean animated) {
@@ -1044,6 +1569,55 @@ index 1ed161bf..9d52bdb0 100644
          }
      }
  
+@@ -31869,6 +31843,25 @@ public class ChatActivity extends BaseFragment implements
+                 fillMessageMenu(primaryMessage, icons, items, options);
+             }
+ 
++            if (!suggestEdit && selectedObject != null && !selectedObject.scheduled
++                    && !selectedObject.isQuickReply() && !selectedObject.isWelcomeMessage()
++                    && (selectedObject.mediaExists || selectedObject.attachPathExists)
++                    && org.telegram.messenger.ExpiringMediaRetention.canBurn(selectedObject.messageOwner)
++                    && (!selectedObject.isHiddenSensitive() || selectedObject.isMediaSpoilersRevealed)) {
++                items.add(LocaleController.getString(R.string.BurnMedia));
++                options.add(OPTION_BURN_MEDIA);
++                icons.add(R.drawable.msg_secret);
++            }
++
++            if (!suggestEdit && selectedObject != null && selectedObject.getId() > 0
++                    && selectedObject.messageOwner.edit_date > 0 && currentEncryptedChat == null
++                    && !selectedObject.scheduled && !selectedObject.isQuickReply() && !selectedObject.isWelcomeMessage()
++                    && (!selectedObject.isHiddenSensitive() || selectedObject.isMediaSpoilersRevealed)) {
++                items.add(LocaleController.getString(R.string.EditsHistory));
++                options.add(OPTION_EDITS_HISTORY);
++                icons.add(R.drawable.msg_edit);
++            }
++
+             if (selectedObject != null && selectedObject.isHiddenSensitive() && !selectedObject.isMediaSpoilersRevealed) {
+                 for (int i = 0; i < options.size(); ++i) {
+                     final int option = options.get(i);
+@@ -34243,6 +34236,22 @@ public class ChatActivity extends BaseFragment implements
+         }
+         boolean preserveDim = false;
+         switch (option) {
++            case OPTION_BURN_MEDIA: {
++                final MessageObject object = selectedObject;
++                getMessagesController().burnRetainedMedia(object, success -> {
++                    if (isFinished || getParentActivity() == null || isPaused() || currentAccount != object.currentAccount) return;
++                    if (success) {
++                        BulletinFactory.of(this).createSimpleBulletin(R.raw.fire_on, LocaleController.getString(R.string.BurnMediaSent)).show();
++                    } else {
++                        BulletinFactory.of(this).createErrorBulletin(LocaleController.getString(R.string.BurnMediaFailed)).show();
++                    }
++                });
++                break;
++            }
++            case OPTION_EDITS_HISTORY: {
++                org.telegram.ui.Components.MessageEditsHistoryDialog.show(this, selectedObject);
++                break;
++            }
+             case OPTION_RETRY: {
+                 final MessageObject object = selectedObject;
+                 final MessageObject.GroupedMessages group = selectedObjectGroup;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java
 index fa2d7e00..2422b2c8 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/AudioPlayerAlert.java
@@ -1107,6 +1681,198 @@ index fa2d7e00..2422b2c8 100644
          int mode = SharedConfig.repeatMode;
          if (mode == 0 || mode == 1) {
              if (SharedConfig.shuffleMusic) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java
+index 81cc95c8..b8706295 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java
+@@ -68,6 +68,59 @@ public class JoinGroupAlert extends BottomSheet {
+         }
+     }
+ 
++    static int getKnownMemberCount(TLRPC.ChatInvite invite, TLRPC.Chat chat, TLRPC.ChatFull full) {
++        if (invite != null && invite.participants_count > 0) {
++            return invite.participants_count;
++        }
++        if (full != null && full.participants_count > 0) {
++            return full.participants_count;
++        }
++        if (full != null && full.participants != null && full.participants.participants != null
++                && !full.participants.participants.isEmpty()) {
++            return full.participants.participants.size();
++        }
++        return chat == null ? 0 : Math.max(0, chat.participants_count);
++    }
++
++    private static void setMemberCount(TextView view, int count, boolean channel) {
++        view.setVisibility(count > 0 ? View.VISIBLE : View.GONE);
++        if (count > 0) {
++            view.setText(LocaleController.formatPluralString(channel ? "Subscribers" : "Members", count));
++        }
++    }
++
++    private void loadMemberCount(TLRPC.Chat chat, TextView view, boolean channel) {
++        TLObject request;
++        if (ChatObject.isChannel(chat)) {
++            if (chat.access_hash == 0 && (chat.fromMessageDialogId == 0 || chat.fromMessageId == 0)) return;
++            TLRPC.TL_channels_getFullChannel req = new TLRPC.TL_channels_getFullChannel();
++            req.channel = MessagesController.getInputChannel(chat);
++            if (req.channel instanceof TLRPC.TL_inputChannelFromMessage) {
++                ((TLRPC.TL_inputChannelFromMessage) req.channel).peer = MessagesController.getInstance(currentAccount).getInputPeer(chat.fromMessageDialogId);
++            }
++            request = req;
++        } else {
++            TLRPC.TL_messages_getFullChat req = new TLRPC.TL_messages_getFullChat();
++            req.chat_id = chat.id;
++            request = req;
++        }
++        memberCountRequestId = ConnectionsManager.getInstance(currentAccount).sendRequest(request, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
++            memberCountRequestId = 0;
++            if (isDismissed() || error != null || !(response instanceof TLRPC.TL_messages_chatFull)) return;
++            TLRPC.TL_messages_chatFull result = (TLRPC.TL_messages_chatFull) response;
++            setMemberCount(view, getKnownMemberCount(null, chat, result.full_chat), channel);
++        }));
++    }
++
++    @Override
++    public void dismiss() {
++        super.dismiss();
++        if (isDismissed() && memberCountRequestId != 0) {
++            ConnectionsManager.getInstance(currentAccount).cancelRequest(memberCountRequestId, true);
++            memberCountRequestId = 0;
++        }
++    }
++
+     public static final int ORIGINATION_OTHER = -1;
+     public static final int ORIGINATION_SPONSORED_CHAT = 0;
+ 
+@@ -77,6 +130,7 @@ public class JoinGroupAlert extends BottomSheet {
+     private TLRPC.Chat currentChat;
+     private TextView requestTextView;
+     private RadialProgressView requestProgressView;
++    private int memberCountRequestId;
+ 
+     public JoinGroupAlert(final Context context, TLObject obj, String group, BaseFragment parentFragment, Theme.ResourcesProvider resourcesProvider) {
+         this(context, obj, group, parentFragment, resourcesProvider, ORIGINATION_OTHER);
+@@ -84,6 +138,9 @@ public class JoinGroupAlert extends BottomSheet {
+ 
+     public JoinGroupAlert(final Context context, TLObject obj, String group, BaseFragment parentFragment, Theme.ResourcesProvider resourcesProvider, int origination) {
+         super(context, false, resourcesProvider);
++        if (parentFragment != null) {
++            currentAccount = parentFragment.getCurrentAccount();
++        }
+         setApplyBottomPadding(false);
+         setApplyTopPadding(false);
+         fixNavigationBarKey(Theme.key_windowBackgroundWhite);
+@@ -163,13 +220,17 @@ public class JoinGroupAlert extends BottomSheet {
+             scam = currentChat.scam;
+         }
+ 
++        TLRPC.Chat countChat = currentChat != null ? currentChat : chatInvite != null ? chatInvite.chat : null;
++        TLRPC.ChatFull countChatFull = countChat == null ? null : MessagesController.getInstance(currentAccount).getChatFull(countChat.id);
++        participants_count = getKnownMemberCount(chatInvite, countChat, countChatFull);
++
+         SimpleTextView simpleTextView = new SimpleTextView(context);
+         simpleTextView.setTypeface(AndroidUtilities.bold());
+         simpleTextView.setTextSize(20);
+         ThemeBind.textColor(simpleTextView, Theme.key_dialogTextBlack, resourcesProvider);
+         simpleTextView.setText(title);
+         simpleTextView.setGravity(Gravity.CENTER);
+-        linearLayout.addView(simpleTextView, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 10, 10, 10, participants_count > 0 ? 0 : 20));
++        linearLayout.addView(simpleTextView, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 10, 10, 10, 0));
+ 
+         if (scam || fake) {
+             simpleTextView.setRightDrawable(getScamDrawable(scam ? 0 : 1));
+@@ -178,6 +239,16 @@ public class JoinGroupAlert extends BottomSheet {
+         }
+ 
+         final boolean isChannel = chatInvite != null && (chatInvite.channel && !chatInvite.megagroup || ChatObject.isChannelAndNotMegaGroup(chatInvite.chat)) || ChatObject.isChannel(currentChat) && !currentChat.megagroup;
++        TextView memberCountView = new TextView(context);
++        memberCountView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
++        memberCountView.setGravity(Gravity.CENTER);
++        ThemeBind.textColor(memberCountView, Theme.key_dialogTextGray3, resourcesProvider);
++        setMemberCount(memberCountView, participants_count, isChannel);
++        linearLayout.addView(memberCountView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 16, 4, 16, 4));
++        if (participants_count <= 0 && countChat != null) {
++            loadMemberCount(countChat, memberCountView, isChannel);
++        }
++
+         boolean hasAbout = !TextUtils.isEmpty(about);
+ 
+         TextView textView = new TextView(context);
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/MessageEditsHistoryDialog.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/MessageEditsHistoryDialog.java
+new file mode 100644
+index 00000000..80eaf983
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/MessageEditsHistoryDialog.java
+@@ -0,0 +1,68 @@
++package org.telegram.ui.Components;
++
++import android.content.Context;
++
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.MessageEditsHistory;
++import org.telegram.messenger.MessageObject;
++import org.telegram.messenger.MessagesStorage;
++import org.telegram.messenger.R;
++import org.telegram.ui.ActionBar.AlertDialog;
++import org.telegram.ui.ActionBar.BaseFragment;
++
++public final class MessageEditsHistoryDialog {
++    private MessageEditsHistoryDialog() {}
++
++    public static void show(BaseFragment fragment, MessageObject message) {
++        showPage(fragment, message.currentAccount, message.getDialogId(), message.getId(), 0);
++    }
++
++    private static String heading(MessageEditsHistory.Entry entry) {
++        return LocaleController.getString(entry.original ? R.string.EditsHistoryOriginal : R.string.EditedMessage)
++                + " · " + LocaleController.formatDateChat(entry.date) + " "
++                + LocaleController.getInstance().getFormatterPreciseTime().format((long) entry.date * 1000);
++    }
++
++    private static String body(MessageEditsHistory.Entry entry) {
++        return entry.message.message == null || entry.message.message.isEmpty()
++                ? LocaleController.getString(R.string.EditsHistoryMedia) : entry.message.message;
++    }
++
++    private static void showPage(BaseFragment fragment, int account, long did, int mid, long beforeSequence) {
++        MessagesStorage.getInstance(account).loadMessageEditsHistory(did, mid, beforeSequence, page -> {
++            Context context = fragment.getParentActivity();
++            if (context == null || fragment.isFinished || fragment.isPaused() || fragment.getCurrentAccount() != account) return;
++            AlertDialog.Builder builder = new AlertDialog.Builder(context, fragment.getResourceProvider());
++            builder.setTitle(LocaleController.getString(R.string.EditsHistory));
++            builder.setPositiveButton(LocaleController.getString(R.string.Close), null);
++            if (page.entries.isEmpty()) {
++                builder.setMessage(LocaleController.getString(R.string.EditsHistoryEmpty));
++            } else {
++                CharSequence[] items = new CharSequence[page.entries.size()];
++                for (int i = 0; i < items.length; i++) {
++                    MessageEditsHistory.Entry entry = page.entries.get(i);
++                    String text = body(entry);
++                    String preview = text.length() > 240 ? text.substring(0, 240) + "…" : text;
++                    items[i] = heading(entry) + "\n" + preview;
++                }
++                builder.setItems(items, (dialog, which) -> {
++                    MessageEditsHistory.Entry entry = page.entries.get(which);
++                    AlertDialog.Builder version = new AlertDialog.Builder(context, fragment.getResourceProvider());
++                    version.setTitle(heading(entry));
++                    version.setMessage(body(entry));
++                    version.setPositiveButton(LocaleController.getString(R.string.Close), null);
++                    version.setNegativeButton(LocaleController.getString(R.string.Back), (d, w) -> showPage(fragment, account, did, mid, beforeSequence));
++                    fragment.showDialog(version.create());
++                });
++                if (page.hasMore) {
++                    long oldest = page.entries.get(page.entries.size() - 1).sequence;
++                    builder.setNegativeButton(LocaleController.getString(R.string.EditsHistoryOlder), (dialog, which) -> showPage(fragment, account, did, mid, oldest));
++                }
++            }
++            if (beforeSequence > 0) {
++                builder.setNeutralButton(LocaleController.getString(R.string.EditsHistoryLatest), (dialog, which) -> showPage(fragment, account, did, mid, 0));
++            }
++            fragment.showDialog(builder.create());
++        });
++    }
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LauncherIconController.java b/TMessagesProj/src/main/java/org/telegram/ui/LauncherIconController.java
 index 49bf8215..9531183b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/LauncherIconController.java
@@ -2874,6 +3640,25 @@ index 00000000..3b8ce7b8
 +<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
 +    <solid android:color="#FFFFFF" />
 +</shape>
+diff --git a/TMessagesProj/src/main/res/drawable/msg_retained_deleted.xml b/TMessagesProj/src/main/res/drawable/msg_retained_deleted.xml
+new file mode 100644
+index 00000000..da327799
+--- /dev/null
++++ b/TMessagesProj/src/main/res/drawable/msg_retained_deleted.xml
+@@ -0,0 +1,13 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="12dp"
++    android:height="12dp"
++    android:viewportWidth="16"
++    android:viewportHeight="16">
++    <path
++        android:fillColor="@android:color/transparent"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="1.3"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round"
++        android:pathData="M3,4 L13,4 M6,4 L6,2.5 L10,2.5 L10,4 M4,4 L4.8,13.5 L11.2,13.5 L12,4 M6.5,6.5 L6.8,11 M9.5,6.5 L9.2,11" />
++</vector>
 diff --git a/TMessagesProj/src/main/res/mipmap-anydpi-v26/ic_launcher.xml b/TMessagesProj/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
 index 5a996b47..17b454c8 100644
 --- a/TMessagesProj/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
@@ -8599,7 +9384,7 @@ index d4683443..05ea3f9e 100644
      <string name="English">Англійська</string>
      <string name="LanguageNameInEnglish">Ukrainian</string>
 diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
-index 9f56ca61..e5409396 100644
+index 9f56ca61..4adbaddd 100644
 --- a/TMessagesProj/src/main/res/values/strings.xml
 +++ b/TMessagesProj/src/main/res/values/strings.xml
 @@ -1,7 +1,7 @@
@@ -8612,14 +9397,38 @@ index 9f56ca61..e5409396 100644
      <string name="LanguageName">English</string>
      <string name="English">English</string>
      <string name="LanguageNameInEnglish">English</string>
-@@ -11678,4 +11678,5 @@
+@@ -11678,4 +11678,14 @@
      <string name="FpnvConsentCountry">Country</string>
      <string name="FpnvConsentMccMnc">MCC / MNC</string>
      <string name="FpnvConsentPhoneNumber">Phone Number</string>
 +    <string name="StopAfterCurrentAudio" translatable="false">Stop after current audio</string>
++    <string name="EditsHistory" translatable="false">Edits history</string>
++    <string name="EditsHistoryOriginal" translatable="false">Original</string>
++    <string name="EditsHistoryEmpty" translatable="false">No saved edit history. Versions that were never received by this app cannot be recovered.</string>
++    <string name="EditsHistoryMedia" translatable="false">Media message without text or caption</string>
++    <string name="EditsHistoryOlder" translatable="false">Older versions</string>
++    <string name="EditsHistoryLatest" translatable="false">Latest versions</string>
++    <string name="BurnMedia" translatable="false">Burn media</string>
++    <string name="BurnMediaSent" translatable="false">Media marked as opened. Your local copy is kept.</string>
++    <string name="BurnMediaFailed" translatable="false">Could not mark media as opened. Please try again.</string>
  </resources>
+diff --git a/TMessagesProj_App/build.gradle b/TMessagesProj_App/build.gradle
+index c581f3de..b9884d80 100644
+--- a/TMessagesProj_App/build.gradle
++++ b/TMessagesProj_App/build.gradle
+@@ -70,8 +70,8 @@ android {
+ 
+     buildTypes {
+         debug {
+-            debuggable true
+-            jniDebuggable true
++            debuggable false
++            jniDebuggable false
+             signingConfig signingConfigs.debug
+             applicationIdSuffix ".beta"
+             minifyEnabled false
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..00a8d594 100644
+index 574e3b80..30556935 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -8627,7 +9436,7 @@ index 574e3b80..00a8d594 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7295
++APP_VERSION_CODE=7296
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false
