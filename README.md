@@ -10,7 +10,7 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7296` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7296-retry` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
 After a successful run, download **EchoGram-13.2.1-7296-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
@@ -30,3 +30,7 @@ Retained remotely deleted messages also show a small trash icon inline with the 
 **Burn media** is available in the message menu for downloaded received disappearing media with a known original TTL. Original TTL and acknowledged Burn state are stored in local-only message custom params (high flags, version-1 compatible). The explicit action sends Telegram read-content receipts, checks acknowledgement, preserves local file payloads, suppresses duplicate in-flight requests and permits retry on failure. Sender expiry follows Telegram and the original timer; no server-side forced-expiry or local delete request is sent. Media normalized by older builds may lack its original TTL marker until Telegram supplies the original media metadata again.
 
 Review before the next build: member-count requests now use the sheet account for message-based access and cancel only after dismissal is accepted; Burn result bulletins are suppressed after account changes. The existing update-compatible build variant keeps its package and signing configuration but disables debuggable/JNI-debug flags and default private/debug diagnostic mode. No new Android APK/device profile was produced during this review. Java syntax, resource references, storage/history pagination, Burn acknowledgement/params compatibility, retention rendering and native account-slot regression checks passed locally.
+
+Build retry after GitHub reported a hosted-runner communication loss: pin Ubuntu 24.04, free unused preinstalled tools, record memory/disk resources before compilation, use one Gradle worker and a 4 GiB heap, restrict native compile/link jobs via a shared Ninja pool, and use ThinLTO with one backend worker. The APK now targets arm64-v8a and armeabi-v7a only, including Redmi 9A; x86 emulator architectures are not packaged. Timeout is 180 minutes. The exact cause of the prior runner disconnect was not established because the build log blob was unavailable.
+
+A dedicated Java-compilation step now runs before APK/native packaging so Java type errors fail early.

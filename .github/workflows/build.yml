@@ -1,7 +1,7 @@
 name: Build EchoGram APK
 on:
   push:
-    branches: [build/echogram-13.2.1-7296]
+    branches: [build/echogram-13.2.1-7296-retry]
     paths:
       - changes.patch
       - .github/workflows/build.yml
@@ -16,10 +16,14 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Free unused runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h .
       - name: Check required secrets
         env:
           API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -72,14 +76,27 @@ jobs:
           s = s.replace('public static boolean SUPPORTS_PASSKEYS = true;', 'public static boolean SUPPORTS_PASSKEYS = false;')
           p.write_text(s)
           PY
+      - name: Record runner resources
+        run: |
+          free -h
+          df -h .
+          getconf _NPROCESSORS_ONLN
+      - name: Check Java compilation
+        working-directory: source
+        env:
+          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          CMAKE_BUILD_PARALLEL_LEVEL: '1'
+        run: ./gradlew :TMessagesProj_App:compileAfatDebugJavaWithJavac --no-daemon --max-workers=1 --console=plain --stacktrace '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g' "-PRELEASE_KEY_ALIAS=$ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD"
       - name: Build APK
         working-directory: source
         env:
           ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
-          CMAKE_BUILD_PARALLEL_LEVEL: '2'
-        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon --max-workers=2 --stacktrace '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g' "-PRELEASE_KEY_ALIAS=$ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD"
+          CMAKE_BUILD_PARALLEL_LEVEL: '1'
+        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon --max-workers=1 --console=plain --stacktrace '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g' "-PRELEASE_KEY_ALIAS=$ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS" "-PRELEASE_KEY_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD" "-PRELEASE_STORE_PASSWORD=$ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD"
       - name: Verify signed APK
         run: |
           for apk in source/TMessagesProj_App/build/outputs/apk/afat/debug/*.apk; do

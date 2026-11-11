@@ -1,8 +1,18 @@
 diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
-index ada7f85b..12aac21c 100644
+index ada7f85b..08d804f3 100644
 --- a/TMessagesProj/build.gradle
 +++ b/TMessagesProj/build.gradle
-@@ -158,14 +158,14 @@ android {
+@@ -142,6 +142,9 @@ android {
+     defaultConfig {
+         minSdkVersion 23
+         targetSdkVersion 36
++        ndk {
++            abiFilters "armeabi-v7a", "arm64-v8a"
++        }
+ 
+         vectorDrawables.generatedDensities = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi']
+ 
+@@ -158,14 +161,14 @@ android {
  
      buildTypes {
          debug {
@@ -20,6 +30,34 @@ index ada7f85b..12aac21c 100644
              buildConfigField "boolean", "BUNDLE", "false"
              buildConfigField "int", "VERSION_NUM", "0"
          }
+diff --git a/TMessagesProj/jni/CMakeLists.txt b/TMessagesProj/jni/CMakeLists.txt
+index 32227053..f0c8cb3b 100644
+--- a/TMessagesProj/jni/CMakeLists.txt
++++ b/TMessagesProj/jni/CMakeLists.txt
+@@ -1,5 +1,10 @@
+ cmake_minimum_required(VERSION 3.16)
+ 
++# Keep hosted-runner native builds within a predictable memory budget.
++set_property(GLOBAL PROPERTY JOB_POOLS echogram_native=1)
++set(CMAKE_JOB_POOL_COMPILE echogram_native)
++set(CMAKE_JOB_POOL_LINK echogram_native)
++
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+@@ -7,9 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
+ set(CMAKE_CXX_FLAGS "-DANDROID -g")
+ set(CMAKE_C_FLAGS "-w -std=c11 -DANDROID -D_LARGEFILE_SOURCE=1 -g -Wno-error=implicit-function-declaration")
+ set(CMAKE_ASM_FLAGS "${CFLAGS} -x assembler-with-cpp")
+-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections -fdata-sections -fvisibility=hidden -flto=full")
+-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden -flto=full")
+-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto=full -Wl,--gc-sections -Wl,--icf=safe -Wl,-Bsymbolic")
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections -fdata-sections -fvisibility=hidden -flto=thin")
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden -flto=thin")
++set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto=thin -Wl,--thinlto-jobs=1 -Wl,--gc-sections -Wl,--icf=safe -Wl,-Bsymbolic")
+ 
+ if (${ANDROID_ABI} STREQUAL "armeabi-v7a" OR ${ANDROID_ABI} STREQUAL "arm64-v8a")
+     enable_language(ASM)
 diff --git a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
 index edab4e2c..d00397e6 100644
 --- a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
@@ -9413,7 +9451,7 @@ index 9f56ca61..4adbaddd 100644
 +    <string name="BurnMediaFailed" translatable="false">Could not mark media as opened. Please try again.</string>
  </resources>
 diff --git a/TMessagesProj_App/build.gradle b/TMessagesProj_App/build.gradle
-index c581f3de..b9884d80 100644
+index c581f3de..d80b38e8 100644
 --- a/TMessagesProj_App/build.gradle
 +++ b/TMessagesProj_App/build.gradle
 @@ -70,8 +70,8 @@ android {
@@ -9427,6 +9465,24 @@ index c581f3de..b9884d80 100644
              signingConfig signingConfigs.debug
              applicationIdSuffix ".beta"
              minifyEnabled false
+@@ -122,7 +122,7 @@ android {
+     productFlavors {
+         bundleAfat {
+             ndk {
+-                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
++                abiFilters "armeabi-v7a", "arm64-v8a"
+             }
+             ext {
+                 abiVersionCode = 1
+@@ -131,7 +131,7 @@ android {
+         }
+         afat {
+             ndk {
+-                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
++                abiFilters "armeabi-v7a", "arm64-v8a"
+             }
+             sourceSets.debug {
+                 manifest.srcFile '../TMessagesProj/config/debug/AndroidManifest_SDK23.xml'
 diff --git a/gradle.properties b/gradle.properties
 index 574e3b80..30556935 100644
 --- a/gradle.properties
