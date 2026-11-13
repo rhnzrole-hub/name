@@ -162,10 +162,23 @@ index 00000000..891a865c
 +    }
 +}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-index 70c5e895..2c361d10 100644
+index 70c5e895..6b9746fe 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-@@ -1459,7 +1459,12 @@ public class FileLoadOperation {
+@@ -177,6 +177,12 @@ public class FileLoadOperation {
+ 
+     private final static int preloadMaxBytes = 2 * 1024 * 1024;
+ 
++    private volatile String lastErrorCode;
++
++    public String getLastErrorCode() {
++        return lastErrorCode;
++    }
++
+     private String fileName;
+     private String storeFileName;
+ 
+@@ -1459,7 +1465,12 @@ public class FileLoadOperation {
      private void cancelRequests(Runnable fullyCancelled) {
          FileLog.d("cancelRequests" + (fullyCancelled != null ? " with callback" : ""));
          if (requestInfos != null) {
@@ -179,7 +192,7 @@ index 70c5e895..2c361d10 100644
              int[] waitingDownloadSize = new int[ConnectionsManager.DownloadConnectionsCount];
              for (int a = 0; a < requestInfos.size(); a++) {
                  RequestInfo requestInfo = requestInfos.get(a);
-@@ -1478,7 +1483,6 @@ public class FileLoadOperation {
+@@ -1478,7 +1489,6 @@ public class FileLoadOperation {
                                  fullyCancelled.run();
                              }
                          };
@@ -187,7 +200,7 @@ index 70c5e895..2c361d10 100644
                          FileLog.d("cancelRequests cancel " + requestInfo.requestToken + " with callback");
                          ConnectionsManager.getInstance(currentAccount).cancelRequest(requestInfo.requestToken, true, () -> {
                              if (requestInfo.whenCancelled != null) {
-@@ -1497,6 +1501,9 @@ public class FileLoadOperation {
+@@ -1497,6 +1507,9 @@ public class FileLoadOperation {
                      ConnectionsManager.getInstance(currentAccount).discardConnection(datacenterId, connectionType);
                  }
              }
@@ -197,6 +210,45 @@ index 70c5e895..2c361d10 100644
          }
      }
  
+@@ -2572,6 +2585,9 @@ public class FileLoadOperation {
+                     if (requestInfo.whenCancelled != null) {
+                         requestInfo.whenCancelled.run();
+                     }
++                    // Only a bounded machine error code is exposed; never peer/file details.
++                    lastErrorCode = error.text != null && error.text.matches("[A-Z0-9_]{1,80}")
++                            ? error.text : "DOWNLOAD_REQUEST_FAILED";
+                     if (error.code == -2000) {
+                         requestInfos.remove(requestInfo);
+                         requestedBytesCount -= requestInfo.chunkSize;
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileRefController.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileRefController.java
+index 8db01301..052c4112 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/FileRefController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileRefController.java
+@@ -581,6 +581,24 @@ public class FileRefController extends BaseController {
+                 req.id.add(messageObject.getRealId());
+                 getConnectionsManager().sendRequest(req, (response, error) -> onRequestComplete(locationKey, parentKey, response, error, true, false));
+             }
++        } else if (parentObject instanceof TLRPC.Message) {
++            // Private copy downloads carry an immutable TL message snapshot, not a UI MessageObject.
++            TLRPC.Message message = (TLRPC.Message) parentObject;
++            if (message.id <= 0 || message instanceof TLRPC.TL_message_secret) {
++                sendErrorToObject(args, 0);
++                return;
++            }
++            long channelId = message.peer_id == null ? 0 : message.peer_id.channel_id;
++            if (channelId != 0) {
++                TLRPC.TL_channels_getMessages req = new TLRPC.TL_channels_getMessages();
++                req.channel = getMessagesController().getInputChannel(channelId);
++                req.id.add(message.id);
++                getConnectionsManager().sendRequest(req, (response, error) -> onRequestComplete(locationKey, parentKey, response, error, true, false));
++            } else {
++                TLRPC.TL_messages_getMessages req = new TLRPC.TL_messages_getMessages();
++                req.id.add(message.id);
++                getConnectionsManager().sendRequest(req, (response, error) -> onRequestComplete(locationKey, parentKey, response, error, true, false));
++            }
+         } else if (parentObject instanceof TLRPC.TL_wallPaper) {
+             TLRPC.TL_wallPaper wallPaper = (TLRPC.TL_wallPaper) parentObject;
+             TL_account.getWallPaper req = new TL_account.getWallPaper();
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java b/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
 index 3a5413ce..6a358ded 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/LocaleController.java
@@ -1083,10 +1135,10 @@ index 4f18f46f..1d87a02f 100644
      public static final int threadMessagesRead = totalEvents++;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java b/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java
 new file mode 100644
-index 00000000..7923baf7
+index 00000000..c00d1c35
 --- /dev/null
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,503 @@
 +package org.telegram.messenger;
 +
 +import org.telegram.tgnet.SerializedData;
@@ -1326,7 +1378,8 @@ index 00000000..7923baf7
 +                public void didFailedLoadingFile(FileLoadOperation operation, int state) {
 +                    AndroidUtilities.runOnUIThread(() -> {
 +                        download = null;
-+                        errorCode = "REASON_" + state;
++                        String serverCode = operation.getLastErrorCode();
++                        errorCode = state == 0 && serverCode != null ? serverCode : "REASON_" + state;
 +                        cleanupFiles();
 +                        finish(false);
 +                    });
@@ -10201,7 +10254,7 @@ index c581f3de..d80b38e8 100644
              sourceSets.debug {
                  manifest.srcFile '../TMessagesProj/config/debug/AndroidManifest_SDK23.xml'
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..8fdbe33a 100644
+index 574e3b80..73ebc842 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -10209,7 +10262,7 @@ index 574e3b80..8fdbe33a 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7298
++APP_VERSION_CODE=7299
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false

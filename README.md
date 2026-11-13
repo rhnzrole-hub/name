@@ -1,6 +1,6 @@
 # EchoGram — unofficial Telegram Android build
 
-Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7298**.
+Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7299**.
 
 Current changes:
 - EchoGram name and the supplied blue/purple icon, including adaptive launcher resources.
@@ -10,9 +10,9 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7298` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7299` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
-After a successful run, download **EchoGram-13.2.1-7298-APK**, then extract **EchoGram-13.2.1.apk**.
+After a successful run, download **EchoGram-13.2.1-7299-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
 
 Local checks cover retention, account isolation, storage-queue ordering, rendering, audio controls, timestamps and launcher resources. Device performance and Android integration still require installing and testing the built APK.
@@ -48,3 +48,7 @@ Build 7297 packages the reviewed forwarding changes and stability fixes. It reta
 Build 7298 fixes protected-copy uploads staged under Context.getCacheDir(), which the real uploader can reject as an internal application file. Use the app-specific external cache for temporary copies/downloads, resolved on the dedicated disk queue; keep the original cache/download state and uploader protection unchanged. If no suitable path is available, fail explicitly with UPLOAD_PATH_BLOCKED instead of weakening the guard. Startup removes both current and legacy temporary directories. Failure reports include the transfer stage, a sanitized server error code when available, and the number of confirmed sends; media contents, paths and credentials are excluded. Default sender identity is implicit unless an alternate identity is actually needed.
 
 Validation for 7298: reproduced the real AndroidUtilities internal-path policy with 4 old/new-path checks; 67 forwarding behavior checks with uploader-path enforcement, legacy cleanup, partial-send counts and sanitized errors; 6 deferred-confirmation checks; changed Java syntax, resources, workflow shell syntax and cumulative patch application pass locally. The prior 7297 GitHub build succeeded; phone-specific success of this fix remains to be tested with 7298.
+
+Build 7299 fixes expired file-reference refresh for the raw TLRPC.Message snapshots used by private forwarding downloads. FileRefController recognized such parents for keys but requestReferenceFromServer lacked their dispatch branch, resulting in reason 0 when a refresh was needed. Fetch the original message through the account controller: channels.getMessages for supergroups/channels, messages.getMessages otherwise; reuse normal reference replacement/resume logic. Nonpositive IDs and secret messages remain excluded. No read/open receipts or normal source-cache writes are added. The downloader exposes only bounded machine error codes to forwarding diagnostics, to distinguish future server failures from generic REASON_0. This defect is reproduced in code; the specific user's group still requires testing with the new APK.
+
+7299 validation: 13 extracted actual refresh-dispatch checks, 6 real download error-code sanitization checks, 67 forwarding lifecycle/upload checks, 9 downloader cancellation checks and Java syntax checks passed. The preceding 7298 GitHub build completed successfully.
