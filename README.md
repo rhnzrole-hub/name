@@ -1,6 +1,6 @@
 # EchoGram — unofficial Telegram Android build
 
-Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7297**.
+Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7298**.
 
 Current changes:
 - EchoGram name and the supplied blue/purple icon, including adaptive launcher resources.
@@ -10,9 +10,9 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7297` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7298` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
-After a successful run, download **EchoGram-13.2.1-7297-APK**, then extract **EchoGram-13.2.1.apk**.
+After a successful run, download **EchoGram-13.2.1-7298-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
 
 Local checks cover retention, account isolation, storage-queue ordering, rendering, audio controls, timestamps and launcher resources. Device performance and Android integration still require installing and testing the built APK.
@@ -44,3 +44,7 @@ Pre-build stability review: move FileLoadOperation.start (temporary-file opens/s
 Validation: 60 forwarding behavior checks, 9 extracted downloader-cancellation checks, 6 deferred-confirmation identity/lifecycle checks; previous retention, audio, disappearing-media, edit history, Burn/params, trash-marker and invite-count lifecycle suites passed. A fresh worker-thread retention check verified ordering and publication; 250,000 retention lookups performed no preferences reads and 100 changes coalesced into one refresh. Rendering/time-format/account-slot checks passed, including 88,000 concurrent native account lookups. All 25 modified Java files pass syntax parsing, changed XML parses, and the cumulative binary patch applies cleanly to upstream. No Android SDK/NDK is installed locally; full Android compilation and Redmi 9A frame-rate/RAM/network testing remain pending. This review did not start a GitHub workflow or APK build.
 
 Build 7297 packages the reviewed forwarding changes and stability fixes. It retains the existing package and signing identity for an in-place update. The preceding 7296 retry completed successfully; its workflow configuration is reused.
+
+Build 7298 fixes protected-copy uploads staged under Context.getCacheDir(), which the real uploader can reject as an internal application file. Use the app-specific external cache for temporary copies/downloads, resolved on the dedicated disk queue; keep the original cache/download state and uploader protection unchanged. If no suitable path is available, fail explicitly with UPLOAD_PATH_BLOCKED instead of weakening the guard. Startup removes both current and legacy temporary directories. Failure reports include the transfer stage, a sanitized server error code when available, and the number of confirmed sends; media contents, paths and credentials are excluded. Default sender identity is implicit unless an alternate identity is actually needed.
+
+Validation for 7298: reproduced the real AndroidUtilities internal-path policy with 4 old/new-path checks; 67 forwarding behavior checks with uploader-path enforcement, legacy cleanup, partial-send counts and sanitized errors; 6 deferred-confirmation checks; changed Java syntax, resources, workflow shell syntax and cumulative patch application pass locally. The prior 7297 GitHub build succeeded; phone-specific success of this fix remains to be tested with 7298.

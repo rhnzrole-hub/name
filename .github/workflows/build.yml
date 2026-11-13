@@ -1,7 +1,7 @@
 name: Build EchoGram APK
 on:
   push:
-    branches: [build/echogram-13.2.1-7297]
+    branches: [build/echogram-13.2.1-7298]
     paths:
       - changes.patch
       - .github/workflows/build.yml
@@ -114,7 +114,7 @@ jobs:
           PYAPK
       - uses: actions/upload-artifact@v4
         with:
-          name: EchoGram-13.2.1-7297-APK
+          name: EchoGram-13.2.1-7298-APK
           path: dist/EchoGram-13.2.1.apk
           if-no-files-found: error
       - name: Remove signing material

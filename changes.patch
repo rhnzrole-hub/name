@@ -1083,10 +1083,10 @@ index 4f18f46f..1d87a02f 100644
      public static final int threadMessagesRead = totalEvents++;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java b/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java
 new file mode 100644
-index 00000000..c1c95bae
+index 00000000..7923baf7
 --- /dev/null
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/ProtectedMessageForwarder.java
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,502 @@
 +package org.telegram.messenger;
 +
 +import org.telegram.tgnet.SerializedData;
@@ -1106,6 +1106,18 @@ index 00000000..c1c95bae
 +    private static final String DIRECTORY = "echogram-forward-upload";
 +
 +    private ProtectedMessageForwarder() {}
++
++    public static final class Result {
++        public final boolean success;
++        public final String detail;
++        public final int completed, total;
++        Result(boolean success, String detail, int completed, int total) {
++            this.success = success;
++            this.detail = detail;
++            this.completed = completed;
++            this.total = total;
++        }
++    }
 +
 +    public static boolean canCopy(MessageObject object) {
 +        if (object == null || !(object.messageOwner instanceof TLRPC.TL_message)
@@ -1131,15 +1143,9 @@ index 00000000..c1c95bae
 +    /** Delete leftovers from a previous process, never source media. Queued before new transfers. */
 +    public static void cleanupStaleFiles() {
 +        diskQueue.postRunnable(() -> {
-+            File root = rootDirectory();
-+            File[] accounts = root.listFiles();
-+            if (accounts != null) for (File account : accounts) {
-+                File[] jobs = account.listFiles();
-+                if (jobs != null) for (File job : jobs) {
-+                    // Startup queues this before any batch directory can be created.
-+                    deleteTree(job);
-+                }
-+            }
++            cleanupRoot(rootDirectory());
++            // Remove leftovers created by older builds in the blocked internal cache.
++            cleanupRoot(new File(ApplicationLoader.applicationContext.getCacheDir(), DIRECTORY));
 +        });
 +    }
 +
@@ -1152,7 +1158,7 @@ index 00000000..c1c95bae
 +
 +    public static boolean start(int account, ArrayList<MessageObject> sources, long peer, long topicId,
 +                                boolean notify, int scheduleDate, int repeatPeriod, long payStars,
-+                                Utilities.Callback<Boolean> done) {
++                                Utilities.Callback<Result> done) {
 +        if (active.containsKey(account) || sources == null || sources.isEmpty() || sources.size() > 100
 +                || DialogObject.isEncryptedDialog(peer)
 +                || MessagesController.getInstance(account).isMonoForum(peer)) return false;
@@ -1183,7 +1189,17 @@ index 00000000..c1c95bae
 +    }
 +
 +    private static File rootDirectory() {
-+        return new File(ApplicationLoader.applicationContext.getCacheDir(), DIRECTORY);
++        File cache = ApplicationLoader.applicationContext.getExternalCacheDir();
++        if (cache == null) cache = ApplicationLoader.applicationContext.getCacheDir();
++        return new File(cache, DIRECTORY);
++    }
++
++    private static void cleanupRoot(File root) {
++        File[] accounts = root.listFiles();
++        if (accounts != null) for (File account : accounts) {
++            File[] jobs = account.listFiles();
++            if (jobs != null) for (File job : jobs) deleteTree(job);
++        }
 +    }
 +
 +    private static void deleteTree(File file) {
@@ -1199,9 +1215,12 @@ index 00000000..c1c95bae
 +        final boolean notify;
 +        final ArrayList<TLRPC.Message> sources;
 +        final ArrayList<String> localPaths;
-+        final Utilities.Callback<Boolean> done;
-+        final File directory;
-+        int index = -1, requestId;
++        final Utilities.Callback<Result> done;
++        final String directoryName = UUID.randomUUID().toString();
++        volatile File directory;
++        String stage = "prepare";
++        String errorCode;
++        int index = -1, requestId, completedCount;
 +        volatile boolean ended;
 +        long lastProgress;
 +        FileLoadOperation download;
@@ -1212,7 +1231,7 @@ index 00000000..c1c95bae
 +
 +        Batch(int account, ArrayList<TLRPC.Message> sources, ArrayList<String> localPaths,
 +              long peer, long topicId, boolean notify, int scheduleDate, int repeatPeriod,
-+              long payStars, Utilities.Callback<Boolean> done) {
++              long payStars, Utilities.Callback<Result> done) {
 +            this.account = account;
 +            this.userId = UserConfig.getInstance(account).getClientUserId();
 +            this.sources = sources;
@@ -1224,7 +1243,6 @@ index 00000000..c1c95bae
 +            this.repeatPeriod = repeatPeriod;
 +            this.payStars = payStars;
 +            this.done = done;
-+            directory = new File(new File(rootDirectory(), Integer.toString(account)), UUID.randomUUID().toString());
 +        }
 +
 +        boolean valid() {
@@ -1249,6 +1267,7 @@ index 00000000..c1c95bae
 +            final TLRPC.Message item = source;
 +            final String attach = localPaths.get(index);
 +            diskQueue.postRunnable(() -> {
++                if (directory == null) directory = new File(new File(rootDirectory(), Integer.toString(account)), directoryName);
 +                File existing = attach == null || attach.isEmpty() ? null : new File(attach);
 +                if (existing == null || !existing.isFile()) existing = FileLoader.getInstance(account).getPathToMessage(item);
 +                if (!existing.isFile()) existing = FileLoader.getInstance(account).getPathToMessage(item, true, true);
@@ -1265,6 +1284,7 @@ index 00000000..c1c95bae
 +        }
 +
 +        void copyForUpload(File existing, File job) {
++            stage = "copy";
 +            // Send only a private copy: normal send/upload machinery cannot move the original.
 +            File copy = new File(job, "upload.bin");
 +            diskQueue.postRunnable(() -> {
@@ -1280,6 +1300,7 @@ index 00000000..c1c95bae
 +        }
 +
 +        void downloadInto(File job) {
++            stage = "download";
 +            TLRPC.MessageMedia media = MessageObject.getMedia(source);
 +            if (media instanceof TLRPC.TL_messageMediaDocument) {
 +                download = new FileLoadOperation(media.document, source);
@@ -1303,7 +1324,12 @@ index 00000000..c1c95bae
 +                    });
 +                }
 +                public void didFailedLoadingFile(FileLoadOperation operation, int state) {
-+                    AndroidUtilities.runOnUIThread(() -> { download = null; cleanupFiles(); finish(false); });
++                    AndroidUtilities.runOnUIThread(() -> {
++                        download = null;
++                        errorCode = "REASON_" + state;
++                        cleanupFiles();
++                        finish(false);
++                    });
 +                }
 +                public void didChangedLoadProgress(FileLoadOperation operation, long loaded, long total) {
 +                    long now = android.os.SystemClock.elapsedRealtime();
@@ -1338,7 +1364,25 @@ index 00000000..c1c95bae
 +        }
 +
 +        void upload(File file) {
-+            if (!valid() || !file.isFile() || file.length() == 0) { finish(false); return; }
++            stage = "upload";
++            if (!valid()) { finish(false); return; }
++            // Match the real uploader's internal-file guard before queueing an upload.
++            diskQueue.postRunnable(() -> {
++                boolean usable = file.isFile() && file.length() > 0;
++                boolean blocked = usable && AndroidUtilities.isInternalUri(android.net.Uri.fromFile(file));
++                AndroidUtilities.runOnUIThread(() -> {
++                    if (!valid()) { finish(false); return; }
++                    if (!usable || blocked) {
++                        errorCode = blocked ? "UPLOAD_PATH_BLOCKED" : "FILE_UNAVAILABLE";
++                        finish(false);
++                        return;
++                    }
++                    beginUpload(file);
++                });
++            });
++        }
++
++        void beginUpload(File file) {
 +            upload = file;
 +            uploadPath = file.getAbsolutePath();
 +            NotificationCenter center = NotificationCenter.getInstance(account);
@@ -1387,6 +1431,7 @@ index 00000000..c1c95bae
 +        }
 +
 +        void send(TLRPC.InputMedia media) {
++            stage = "send";
 +            if (!valid()) { finish(false); return; }
 +            MessagesController controller = MessagesController.getInstance(account);
 +            TLRPC.InputPeer destination = controller.getInputPeer(peer);
@@ -1405,7 +1450,7 @@ index 00000000..c1c95bae
 +                if (full != null && full.default_send_as != null) sender = DialogObject.getPeerDialogId(full.default_send_as);
 +                else if (chat != null && (chat.admin_rights != null && chat.admin_rights.anonymous
 +                        || ChatObject.isChannelAndNotMegaGroup(chat) && !chat.signatures)) sender = peer;
-+                sendAs = controller.getInputPeer(sender);
++                if (sender != userId) sendAs = controller.getInputPeer(sender);
 +            }
 +            final TLRPC.InputPeer senderPeer = sendAs;
 +            TLObject request;
@@ -1444,7 +1489,14 @@ index 00000000..c1c95bae
 +                AndroidUtilities.runOnUIThread(() -> {
 +                    requestId = 0;
 +                    if (!valid()) { finish(false); return; }
-+                    if (error != null || !(response instanceof TLRPC.Updates)) { finish(false); return; }
++                    if (error != null || !(response instanceof TLRPC.Updates)) {
++                        // Never include source text, filenames, paths, peers or credentials.
++                        errorCode = error != null && error.text != null && error.text.matches("[A-Z0-9_]{1,80}")
++                                ? error.text : "REQUEST_FAILED";
++                        finish(false);
++                        return;
++                    }
++                    completedCount++;
 +                    applyUpdates((TLRPC.Updates) response, senderPeer);
 +                    final File completed = upload;
 +                    upload = null;
@@ -1515,7 +1567,7 @@ index 00000000..c1c95bae
 +        }
 +
 +        void cleanupFiles() {
-+            diskQueue.postRunnable(() -> deleteTree(directory));
++            diskQueue.postRunnable(() -> { if (directory != null) deleteTree(directory); });
 +        }
 +
 +        void finish(boolean success) {
@@ -1533,7 +1585,7 @@ index 00000000..c1c95bae
 +                diskQueue.postRunnable(operation::cancel);
 +                // Its terminal delegate runs after the downloader has closed all writers.
 +            } else cleanupFiles();
-+            if (done != null) done.run(success);
++            if (done != null) done.run(new Result(success, success ? "" : stage + (errorCode == null ? "" : ": " + errorCode), completedCount, sources.size()));
 +        }
 +    }
 +}
@@ -2003,7 +2055,7 @@ index 4f0508f1..d42c2572 100644
              return;
          }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index 1ed161bf..0e3530cc 100644
+index 1ed161bf..db77db6a 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 @@ -1240,6 +1240,8 @@ public class ChatActivity extends BaseFragment implements
@@ -2031,7 +2083,7 @@ index 1ed161bf..0e3530cc 100644
              .add(NotificationCenter.messagesDeleted)
              .add(NotificationCenter.historyCleared)
              .add(NotificationCenter.messageReceivedByServer)
-@@ -12735,46 +12739,75 @@ public class ChatActivity extends BaseFragment implements
+@@ -12735,46 +12739,77 @@ public class ChatActivity extends BaseFragment implements
          updateSelectedMessageReactions();
      }
  
@@ -2114,9 +2166,11 @@ index 1ed161bf..0e3530cc 100644
 +                if (fragment.isFinished || isFinished || currentAccount != account
 +                        || UserConfig.getInstance(account).getClientUserId() != sourceUserId) return;
 +                boolean started = org.telegram.messenger.ProtectedMessageForwarder.start(account, sources,
-+                        target.dialogId, target.topicId, notify, scheduleDate, repeatPeriod, payStars, success -> {
++                        target.dialogId, target.topicId, notify, scheduleDate, repeatPeriod, payStars, result -> {
++                    String text = result.success ? LocaleController.getString(R.string.ProtectedForwardDone)
++                            : LocaleController.formatString(R.string.ProtectedForwardFailed, result.detail, result.completed, result.total);
 +                    android.widget.Toast.makeText(ApplicationLoader.applicationContext,
-+                            LocaleController.getString(success ? R.string.ProtectedForwardDone : R.string.ProtectedForwardFailed), android.widget.Toast.LENGTH_LONG).show();
++                            text, android.widget.Toast.LENGTH_LONG).show();
 +                });
 +                android.widget.Toast.makeText(ApplicationLoader.applicationContext,
 +                        LocaleController.getString(started ? R.string.ProtectedForwardStarted : R.string.ProtectedForwardUnavailable), android.widget.Toast.LENGTH_LONG).show();
@@ -2142,7 +2196,7 @@ index 1ed161bf..0e3530cc 100644
              return;
          }
          int hasPoll = 0;
-@@ -19878,7 +19911,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -19878,7 +19913,7 @@ public class ChatActivity extends BaseFragment implements
                          cantDeleteMessagesCount--;
                      }
                      boolean noforwards = isPeerNoForwards();
@@ -2151,7 +2205,7 @@ index 1ed161bf..0e3530cc 100644
                          cantForwardMessagesCount--;
                      } else {
                          canForwardMessagesCount--;
-@@ -19915,7 +19948,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -19915,7 +19950,7 @@ public class ChatActivity extends BaseFragment implements
                          cantDeleteMessagesCount++;
                      }
                      boolean noforwards = isPeerNoForwards();
@@ -2160,7 +2214,7 @@ index 1ed161bf..0e3530cc 100644
                          cantForwardMessagesCount++;
                      } else {
                          canForwardMessagesCount++;
-@@ -23091,6 +23124,18 @@ public class ChatActivity extends BaseFragment implements
+@@ -23091,6 +23126,18 @@ public class ChatActivity extends BaseFragment implements
              if (updated && chatAdapter != null) {
                  chatAdapter.notifyDataSetChanged(false);
              }
@@ -2179,7 +2233,7 @@ index 1ed161bf..0e3530cc 100644
          } else if (id == NotificationCenter.messagesDeleted) {
              boolean scheduled = (Boolean) args[2];
              if (scheduled != (chatMode == MODE_SCHEDULED)) {
-@@ -25759,55 +25804,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -25759,55 +25806,13 @@ public class ChatActivity extends BaseFragment implements
      private Pattern sponsoredUrlPattern;
      private MessageObject botSponsoredMessage;
      private void addSponsoredMessages(boolean animated) {
@@ -2241,7 +2295,7 @@ index 1ed161bf..0e3530cc 100644
          }
      }
  
-@@ -31869,6 +31872,25 @@ public class ChatActivity extends BaseFragment implements
+@@ -31869,6 +31874,25 @@ public class ChatActivity extends BaseFragment implements
                  fillMessageMenu(primaryMessage, icons, items, options);
              }
  
@@ -2267,7 +2321,7 @@ index 1ed161bf..0e3530cc 100644
              if (selectedObject != null && selectedObject.isHiddenSensitive() && !selectedObject.isMediaSpoilersRevealed) {
                  for (int i = 0; i < options.size(); ++i) {
                      final int option = options.get(i);
-@@ -34243,6 +34265,22 @@ public class ChatActivity extends BaseFragment implements
+@@ -34243,6 +34267,22 @@ public class ChatActivity extends BaseFragment implements
          }
          boolean preserveDim = false;
          switch (option) {
@@ -2290,7 +2344,7 @@ index 1ed161bf..0e3530cc 100644
              case OPTION_RETRY: {
                  final MessageObject object = selectedObject;
                  final MessageObject.GroupedMessages group = selectedObjectGroup;
-@@ -34280,6 +34318,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -34280,6 +34320,13 @@ public class ChatActivity extends BaseFragment implements
                  break;
              }
              case OPTION_FORWARD: {
@@ -2304,7 +2358,7 @@ index 1ed161bf..0e3530cc 100644
                  if (getMessagesController().isFrozen()) {
                      AccountFrozenAlert.show(currentAccount);
                      selectedObject = null;
-@@ -46850,7 +46895,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46850,7 +46897,7 @@ public class ChatActivity extends BaseFragment implements
                      && (!selectedObject.needDrawBluredPreview() || selectedObject.hasExtendedMediaPreview())
                      && !selectedObject.isLiveLocation()
                      && selectedObject.type != MessageObject.TYPE_PHONE_CALL
@@ -10079,7 +10133,7 @@ index d4683443..05ea3f9e 100644
      <string name="English">Англійська</string>
      <string name="LanguageNameInEnglish">Ukrainian</string>
 diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
-index 9f56ca61..f6eb08a0 100644
+index 9f56ca61..a3a24f88 100644
 --- a/TMessagesProj/src/main/res/values/strings.xml
 +++ b/TMessagesProj/src/main/res/values/strings.xml
 @@ -1,7 +1,7 @@
@@ -10108,7 +10162,7 @@ index 9f56ca61..f6eb08a0 100644
 +    <string name="BurnMediaFailed" translatable="false">Could not mark media as opened. Please try again.</string>
 +    <string name="ProtectedForwardStarted" translatable="false">Downloading and sending copies…</string>
 +    <string name="ProtectedForwardDone" translatable="false">Copies sent. Temporary downloads removed.</string>
-+    <string name="ProtectedForwardFailed" translatable="false">Could not finish forwarding. Some messages may already have been sent.</string>
++    <string name="ProtectedForwardFailed" translatable="false">Forward failed: %1$s (sent %2$d/%3$d).</string>
 +    <string name="ProtectedForwardUnavailable" translatable="false">Cannot copy these messages to this chat, or another transfer is still running.</string>
 +    <string name="ProtectedForwardNoComment" translatable="false">Send the comment separately when forwarding protected messages.</string>
 +    <string name="ProtectedForwardSingleChat" translatable="false">Choose one destination chat.</string>
@@ -10147,7 +10201,7 @@ index c581f3de..d80b38e8 100644
              sourceSets.debug {
                  manifest.srcFile '../TMessagesProj/config/debug/AndroidManifest_SDK23.xml'
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..207d2f71 100644
+index 574e3b80..8fdbe33a 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -10155,7 +10209,7 @@ index 574e3b80..207d2f71 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7297
++APP_VERSION_CODE=7298
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false
