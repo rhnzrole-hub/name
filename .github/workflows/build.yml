@@ -2,9 +2,10 @@
 name: Build Telegram Plus APK
 on:
   push:
-    branches: [build/telegram-plus-13.2.2-7303]
+    branches: [build/telegram-plus-13.2.2-7304]
     paths:
       - changes.patch
+      - updates.patch
       - .github/workflows/build.yml
   workflow_dispatch:
 
@@ -55,6 +56,11 @@ jobs:
           git -C source submodule update --init --recursive --depth 1 --jobs 4
           git -C source apply --check "$GITHUB_WORKSPACE/changes.patch"
           git -C source apply "$GITHUB_WORKSPACE/changes.patch"
+          # Keep the previously published base unchanged; apply the complete post-build delta once.
+          git -C source apply --check "$GITHUB_WORKSPACE/updates.patch"
+          git -C source apply "$GITHUB_WORKSPACE/updates.patch"
+      - name: Set update build number
+        run: sed -i 's/^APP_VERSION_CODE=.*/APP_VERSION_CODE=7304/' source/gradle.properties
       - name: Limit native build to ARM phones
         run: |
           python3 - <<'PYARM'
@@ -123,16 +129,16 @@ jobs:
           apks = list(pathlib.Path('source/TMessagesProj_App/build/outputs/apk/afat/debug').glob('*.apk'))
           if len(apks) != 1:
               raise SystemExit('Expected one universal APK, got ' + str(len(apks)))
-          shutil.copy2(apks[0], 'dist/Telegram-Plus-13.2.2.apk')
+          shutil.copy2(apks[0], 'dist/Telegram-Plus-13.2.2-7304.apk')
           PYAPK
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/Telegram-Plus-13.2.2.apk > dist/apk-info.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/Telegram-Plus-13.2.2-7304.apk > dist/apk-info.txt
           grep -q "package: name='org.telegram.plus.beta'" dist/apk-info.txt
           grep -q "application-label:'Telegram Plus'" dist/apk-info.txt
           grep -q "native-code:.*'armeabi-v7a'" dist/apk-info.txt
-          (cd dist && sha256sum Telegram-Plus-13.2.2.apk > SHA256SUMS.txt)
+          (cd dist && sha256sum Telegram-Plus-13.2.2-7304.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Plus-13.2.2-7303-APK
+          name: Telegram-Plus-13.2.2-7304-APK
           path: dist/*
           if-no-files-found: error
       - name: Remove signing material
