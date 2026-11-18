@@ -2,15 +2,18 @@
 name: Build Telegram Plus APK
 on:
   push:
-    branches: [build/telegram-plus-13.2.2-7304]
+    branches: [build/telegram-plus-13.2.2-7305]
     paths:
       - changes.patch
       - updates.patch
+      - updates-7305.patch
+      - verify_update.py
       - .github/workflows/build.yml
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: telegram-plus-${{ github.ref }}
@@ -59,8 +62,10 @@ jobs:
           # Keep the previously published base unchanged; apply the complete post-build delta once.
           git -C source apply --check "$GITHUB_WORKSPACE/updates.patch"
           git -C source apply "$GITHUB_WORKSPACE/updates.patch"
+          git -C source apply --check "$GITHUB_WORKSPACE/updates-7305.patch"
+          git -C source apply "$GITHUB_WORKSPACE/updates-7305.patch"
       - name: Set update build number
-        run: sed -i 's/^APP_VERSION_CODE=.*/APP_VERSION_CODE=7304/' source/gradle.properties
+        run: sed -i 's/^APP_VERSION_CODE=.*/APP_VERSION_CODE=7305/' source/gradle.properties
       - name: Limit native build to ARM phones
         run: |
           python3 - <<'PYARM'
@@ -95,6 +100,18 @@ jobs:
           s = s.replace('public static boolean SUPPORTS_PASSKEYS = true;', 'public static boolean SUPPORTS_PASSKEYS = false;')
           p.write_text(s)
           PY
+      - name: Download previous signed APK for upgrade verification
+        uses: actions/download-artifact@v4
+        with:
+          name: Telegram-Plus-13.2.2-7304-APK
+          run-id: 43883049257
+          github-token: ${{ github.token }}
+          path: previous-build
+      - name: Verify configured signing key against previous APK
+        env:
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: python3 verify_update.py baseline --old-dir previous-build --keystore source/TMessagesProj/config/release.keystore --output previous-apk-identity.json
       - name: Record runner resources
         run: |
           free -h
@@ -129,16 +146,18 @@ jobs:
           apks = list(pathlib.Path('source/TMessagesProj_App/build/outputs/apk/afat/debug').glob('*.apk'))
           if len(apks) != 1:
               raise SystemExit('Expected one universal APK, got ' + str(len(apks)))
-          shutil.copy2(apks[0], 'dist/Telegram-Plus-13.2.2-7304.apk')
+          shutil.copy2(apks[0], 'dist/Telegram-Plus-13.2.2-7305.apk')
           PYAPK
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/Telegram-Plus-13.2.2-7304.apk > dist/apk-info.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/Telegram-Plus-13.2.2-7305.apk > dist/apk-info.txt
           grep -q "package: name='org.telegram.plus.beta'" dist/apk-info.txt
           grep -q "application-label:'Telegram Plus'" dist/apk-info.txt
           grep -q "native-code:.*'armeabi-v7a'" dist/apk-info.txt
-          (cd dist && sha256sum Telegram-Plus-13.2.2-7304.apk > SHA256SUMS.txt)
+          (cd dist && sha256sum Telegram-Plus-13.2.2-7305.apk > SHA256SUMS.txt)
+      - name: Verify installed-app update compatibility
+        run: python3 verify_update.py check --apk dist/Telegram-Plus-13.2.2-7305.apk --baseline previous-apk-identity.json --report dist/update-compatibility.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Plus-13.2.2-7304-APK
+          name: Telegram-Plus-13.2.2-7305-APK
           path: dist/*
           if-no-files-found: error
       - name: Remove signing material
