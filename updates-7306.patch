@@ -1,0 +1,352 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java b/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
+index 4d0a8f5..72f5c25 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
+@@ -214,8 +214,12 @@ public class ApplicationLoader extends Application {
+ 
+                     boolean isSlow = isConnectionSlow();
+                     for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+-                        ConnectionsManager.getInstance(a).checkConnection();
+-                        FileLoader.getInstance(a).onNetworkChanged(isSlow);
++                        // Include an in-progress login, but never instantiate an
++                        // unused account merely because connectivity changed.
++                        ConnectionsManager connections = ConnectionsManager.getInstanceIfCreated(a);
++                        if (connections != null) connections.checkConnection();
++                        FileLoader loader = FileLoader.getInstanceIfCreated(a);
++                        if (loader != null) loader.onNetworkChanged(isSlow);
+                     }
+                 }
+             };
+@@ -248,10 +252,15 @@ public class ApplicationLoader extends Application {
+ 
+         SharedConfig.loadConfig();
+         SharedPrefsHelper.init(applicationContext);
+-        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) { //TODO improve account
++        // Load all lightweight configs first: slot 0 restores selectedAccount.
++        // Unused slots must not create databases, native connections or loaders.
++        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+             UserConfig.getInstance(a).loadConfig();
++        }
++        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
++            if (!shouldInitializeAccount(a)) continue;
+             MessagesController.getInstance(a);
+-            if (a == 0) {
++            if (a == UserConfig.selectedAccount) {
+                 SharedConfig.pushStringStatus = "__FIREBASE_GENERATING_SINCE_" + ConnectionsManager.getInstance(a).getCurrentTime() + "__";
+             } else {
+                 ConnectionsManager.getInstance(a);
+@@ -270,7 +279,8 @@ public class ApplicationLoader extends Application {
+         }
+ 
+         MediaController.getInstance();
+-        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) { //TODO improve account
++        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
++            if (!shouldInitializeAccount(a)) continue;
+             ContactsController.getInstance(a).checkAppAccount();
+             DownloadController.getInstance(a);
+         }
+@@ -281,6 +291,10 @@ public class ApplicationLoader extends Application {
+                 () -> org.telegram.utils.twidget.WidgetSandboxSession.prewarmEngine(applicationContext)), 3000);
+     }
+ 
++    private static boolean shouldInitializeAccount(int account) {
++        return account == UserConfig.selectedAccount || UserConfig.getInstance(account).isClientActivated();
++    }
++
+     public ApplicationLoader() {
+         super();
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
+index 6056068..ad29ce1 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
+@@ -230,6 +230,10 @@ public class FileLoader extends BaseController {
+ 
+     private static final FileLoader[] Instance = new FileLoader[UserConfig.MAX_ACCOUNT_COUNT];
+ 
++    public static synchronized FileLoader getInstanceIfCreated(int num) {
++        return Instance[num];
++    }
++
+     public static FileLoader getInstance(int num) {
+         FileLoader localInstance = Instance[num];
+         if (localInstance == null) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/TelegramPlusFolderMembership.java b/TMessagesProj/src/main/java/org/telegram/messenger/TelegramPlusFolderMembership.java
+index 8cd9335..c223b9c 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/TelegramPlusFolderMembership.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/TelegramPlusFolderMembership.java
+@@ -12,6 +12,7 @@ public final class TelegramPlusFolderMembership {
+     private static class State {
+         final ArrayList<HashSet<Long>> included = new ArrayList<>();
+         final ArrayList<HashSet<Long>> excluded = new ArrayList<>();
++        final Snapshot[] snapshots = new Snapshot[6];
+     }
+     private TelegramPlusFolderMembership() {}
+     private static String key(int account, int category, boolean include) {
+@@ -55,12 +56,17 @@ public final class TelegramPlusFolderMembership {
+     }
+     public static synchronized Snapshot snapshot(int account, int category) {
+         if (category < 0 || category >= 6) throw new IllegalArgumentException("Invalid category");
+-        return new Snapshot(state(account), category);
++        State state = state(account);
++        if (state.snapshots[category] == null) state.snapshots[category] = new Snapshot(state, category);
++        return state.snapshots[category];
+     }
+     public static synchronized Snapshot[] snapshots(int account) {
+         State state = state(account);
+         Snapshot[] result = new Snapshot[6];
+-        for (int i = 0; i < result.length; i++) result[i] = new Snapshot(state, i);
++        for (int i = 0; i < result.length; i++) {
++            if (state.snapshots[i] == null) state.snapshots[i] = new Snapshot(state, i);
++            result[i] = state.snapshots[i];
++        }
+         return result;
+     }
+     public static synchronized int membership(int account, int category, long dialogId) {
+@@ -87,6 +93,7 @@ public final class TelegramPlusFolderMembership {
+             state.excluded.get(category).remove(id);
+             (include ? state.included : state.excluded).get(category).add(id);
+         }
++        state.snapshots[category] = null;
+         MessagesController.getMainSettings(account).edit()
+                 .putStringSet(key(account, category, true), encode(state.included.get(category)))
+                 .putStringSet(key(account, category, false), encode(state.excluded.get(category))).apply();
+diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+index ab54ee3..d1bce50 100644
+--- a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
++++ b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+@@ -197,6 +197,10 @@ public class ConnectionsManager extends BaseController {
+     private static int lastClassGuid = 1;
+     
+     private static final ConnectionsManager[] Instance = new ConnectionsManager[UserConfig.MAX_ACCOUNT_COUNT];
++    public static synchronized ConnectionsManager getInstanceIfCreated(int num) {
++        return Instance[num];
++    }
++
+     public static ConnectionsManager getInstance(int num) {
+         ConnectionsManager localInstance = Instance[num];
+         if (localInstance == null) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
+index 5dc090f..ccb582c 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
+@@ -6207,14 +6207,6 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+                     updateButtonState(false, false, false);
+                 }
+             }
+-            if (messageObject.hasVideoQualities()) {
+-                if (messageObject.highestQuality != null && !messageObject.highestQuality.isManifestCached()) {
+-                    FileLoader.getInstance(currentAccount).loadFile(messageObject.highestQuality.manifestDocument, messageObject, FileLoader.PRIORITY_NORMAL, 0);
+-                }
+-                if (messageObject.thumbQuality != null && !messageObject.thumbQuality.isManifestCached()) {
+-                    FileLoader.getInstance(currentAccount).loadFile(messageObject.thumbQuality.manifestDocument, messageObject, FileLoader.PRIORITY_NORMAL, 0);
+-                }
+-            }
+         }
+     }
+ 
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/VideoPlayer.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/VideoPlayer.java
+index 48f421f..0053729 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/VideoPlayer.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/VideoPlayer.java
+@@ -591,6 +591,9 @@ public class VideoPlayer implements Player.Listener, VideoListener, AnalyticsLis
+     }
+ 
+     public int getCurrentQualityIndex() {
++        if (!currentStreamIsHls && videoQualityToSelect != null && videoQualities != null) {
++            return videoQualities.indexOf(videoQualityToSelect);
++        }
+         if (selectedQualityIndex == QUALITY_AUTO) {
+             try {
+                 if (autoIsOriginal) {
+@@ -721,77 +724,38 @@ public class VideoPlayer implements Player.Listener, VideoListener, AnalyticsLis
+             fallbackDuration = player.getDuration();
+         }
+ 
+-        boolean reset = false;
+-
+-        videoQualityToSelect = quality;
+-        if (quality == null) { // AUTO
+-            final Uri hlsManifest = makeManifest(videoQualities);
+-            final Quality original = getOriginalQuality();
+-            if (original != null && original.uris.size() == 1 && original.uris.get(0).isCached()) {
+-                currentStreamIsHls = false;
+-                autoIsOriginal = true;
+-                quality = original;
+-                videoQualityToSelect = quality;
+-                player.setMediaSource(mediaSourceFromUri(quality.getDownloadUri(), "other"), false);
+-                reset = true;
+-            } else if (hlsManifest != null) {
+-                autoIsOriginal = false;
+-                trackSelector.setParameters(trackSelector.getParameters().buildUpon().clearOverrides().build());
+-                if (!currentStreamIsHls) {
+-                    currentStreamIsHls = true;
+-                    player.setMediaSource(mediaSourceFromUri(hlsManifest, 0, "hls"), false);
+-                    reset = true;
++        final VideoUri selectedUri;
++        if (quality == null) {
++            // Auto chooses one file, rather than an adaptive manifest that can
++            // fetch multiple resolutions/codecs during the same playback.
++            selectedUri = getQualityForPlayer(videoQualities);
++            if (selectedUri == null) return;
++            for (Quality candidate : videoQualities) {
++                if (candidate.uris.contains(selectedUri)) {
++                    quality = candidate;
++                    break;
+                 }
+-            } else {
+-                quality = getHighestQuality(true);
+-                if (quality == null) quality = getHighestQuality(false);
+-                if (quality == null || quality.uris.isEmpty()) return;
+-                currentStreamIsHls = false;
+-                videoQualityToSelect = quality;
+-                autoIsOriginal = quality.original;
+-                player.setMediaSource(mediaSourceFromUri(quality.getDownloadUri(), "other"), false);
+-                reset = true;
+             }
+         } else {
+-            autoIsOriginal = false;
+-            if (quality.uris.isEmpty()) return;
+-            Uri hlsManifest = null;
+-            if (quality.uris.size() > 1) {
+-                hlsManifest = makeManifest(videoQualities);
+-            }
+-            if (hlsManifest == null || quality.uris.size() == 1 || trackSelector.getCurrentMappedTrackInfo() == null) {
+-                currentStreamIsHls = false;
+-                player.setMediaSource(mediaSourceFromUri(quality.getDownloadUri(), "other"), false);
+-                reset = true;
+-            } else {
+-                if (!currentStreamIsHls) {
+-                    currentStreamIsHls = true;
+-                    player.setMediaSource(mediaSourceFromUri(hlsManifest, 0, "hls"), false);
+-                    reset = true;
+-                }
+-                TrackSelectionParameters.Builder selector = trackSelector.getParameters().buildUpon().clearOverrides();
+-                for (VideoUri uri : quality.uris) {
+-                    TrackSelectionOverride override = getQualityTrackSelection(uri);
+-                    if (override == null) continue;
+-                    selector.addOverride(override);
+-                }
+-                trackSelector.setParameters(selector.build());
+-            }
++            selectedUri = quality.getDownloadUri();
+         }
+-
+-        if (reset) {
+-            player.prepare();
+-            if (!start) {
+-                player.seekTo(lastPosition);
+-                if (lastPlaying) {
+-                    player.play();
+-                }
+-            }
+-            if (onQualityChangeListener != null) {
+-                AndroidUtilities.runOnUIThread(onQualityChangeListener);
++        if (selectedUri == null) return;
++        videoQualityToSelect = quality;
++        autoIsOriginal = selectedQualityIndex == QUALITY_AUTO && quality != null && quality.original;
++        currentStreamIsHls = false;
++        trackSelector.setParameters(trackSelector.getParameters().buildUpon().clearOverrides().build());
++        player.setMediaSource(mediaSourceFromUri(selectedUri, "other"), false);
++        player.prepare();
++        if (!start) {
++            player.seekTo(lastPosition);
++            if (lastPlaying) {
++                player.play();
+             }
+-            activePlayers.add(playerId);
+         }
++        if (onQualityChangeListener != null) {
++            AndroidUtilities.runOnUIThread(onQualityChangeListener);
++        }
++        activePlayers.add(playerId);
+     }
+ 
+     public Quality getCurrentQuality() {
+@@ -899,37 +863,13 @@ public class VideoPlayer implements Player.Listener, VideoListener, AnalyticsLis
+     public static TLRPC.Document getDocumentForThumb(int currentAccount, TLRPC.MessageMedia media) {
+         if (!(media instanceof TLRPC.TL_messageMediaDocument))
+             return null;
+-        final VideoUri videoUri = getQualityForThumb(getQualities(currentAccount, media.document, media.alt_documents, 0, true));
++        final VideoUri videoUri = getQualityForThumb(getQualities(currentAccount, media.document, media.alt_documents, 0, false));
+         return videoUri == null ? null : videoUri.document;
+     }
+ 
+     public static VideoUri getQualityForThumb(ArrayList<Quality> qualities) {
+-        for (final Quality q : qualities) {
+-            for (final VideoUri v : q.uris) {
+-                if (v.isCached())
+-                    return v;
+-            }
+-        }
+-
+-        final int MAX_SIZE = 900;
+-        VideoUri uri = null;
+-        for (final Quality q : qualities) {
+-            for (final VideoUri v : q.uris) {
+-                if (!v.original && (uri == null || uri.width * uri.height > v.width * v.height || v.bitrate < uri.bitrate) && v.width <= MAX_SIZE && v.height <= MAX_SIZE) {
+-                    uri = v;
+-                }
+-            }
+-        }
+-        if (uri == null) {
+-            for (final Quality q : qualities) {
+-                for (final VideoUri v : q.uris) {
+-                    if ((uri == null || uri.width * uri.height > v.width * v.height || v.bitrate < uri.bitrate)) {
+-                        uri = v;
+-                    }
+-                }
+-            }
+-        }
+-        return uri;
++        // Preview, automatic download and full-screen playback share one variant.
++        return getQualityForPlayer(qualities);
+     }
+ 
+     public static VideoUri getCachedQuality(ArrayList<Quality> qualities) {
+@@ -942,9 +882,10 @@ public class VideoPlayer implements Player.Listener, VideoListener, AnalyticsLis
+     }
+ 
+     public static VideoUri getQualityForPlayer(ArrayList<Quality> qualities) {
++        if (qualities == null) return null;
+         for (final Quality q : qualities) {
+             for (final VideoUri v : q.uris) {
+-                if (v.original && v.isCached())
++                if (v.isCached())
+                     return v;
+             }
+         }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index 7d0d562..2559bbb 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -7568,7 +7568,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 fragmentSearchField.editText.clearFocus();
+             }
+             return false;
+-        } else if (filterTabsView != null && filterTabsView.getVisibility() == View.VISIBLE && !tabsAnimationInProgress && !filterTabsView.isAnimatingIndicator() && !startedTracking && !filterTabsView.isFirstTabSelected()) {
++        } else if (!usesPlusCategoryTabs() && filterTabsView != null && filterTabsView.getVisibility() == View.VISIBLE && !tabsAnimationInProgress && !filterTabsView.isAnimatingIndicator() && !startedTracking && !filterTabsView.isFirstTabSelected()) {
+             if (invoked) filterTabsView.selectFirstTab();
+             return false;
+         } else if (commentView != null && commentView.isPopupShowing()) {
+@@ -14772,4 +14772,4 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         keys.add(Theme.key_actionBarDefaultSubmenuItem);
+         keys.add(Theme.key_actionBarDefaultSubmenuBackground);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/PhotoViewer.java b/TMessagesProj/src/main/java/org/telegram/ui/PhotoViewer.java
+index e2c9856..ede44bc 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/PhotoViewer.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/PhotoViewer.java
+@@ -10716,7 +10716,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
+             }
+ 
+             if (videoUrises != null) {
+-                videoPlayer.preparePlayer(videoUrises, VideoPlayer.getSavedQuality(videoUrises, currentMessageObject));
++                // Always open in Auto; it reuses a cached variant when available.
++                videoPlayer.preparePlayer(videoUrises, null);
+             } else {
+                 videoPlayer.preparePlayer(uri, "other", FileLoader.PRIORITY_HIGH, videoByteOffset);
+             }
