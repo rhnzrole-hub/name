@@ -116,6 +116,295 @@ index 2a18412d..7c328023 100644
          NativeLoader.initNativeLibs(ApplicationLoader.applicationContext);
  
          try {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/DeleteOwnGroupMessages.java b/TMessagesProj/src/main/java/org/telegram/messenger/DeleteOwnGroupMessages.java
+new file mode 100644
+index 00000000..90de96a7
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/DeleteOwnGroupMessages.java
+@@ -0,0 +1,283 @@
++package org.telegram.messenger;
++
++import org.telegram.SQLite.SQLiteCursor;
++import org.telegram.tgnet.NativeByteBuffer;
++import org.telegram.tgnet.TLObject;
++import org.telegram.tgnet.TLRPC;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashSet;
++
++/** Explicit, confirmed deletion of the authenticated user's messages. UI-thread entry points. */
++public final class DeleteOwnGroupMessages {
++    private static final int PAGE_SIZE = 100;
++    private static final HashMap<Integer, Job> active = new HashMap<>();
++    private DeleteOwnGroupMessages() {}
++
++    public static final class Result {
++        public final boolean success, cancelled;
++        public final int deleted;
++        public final String error;
++        Result(boolean success, boolean cancelled, int deleted, String error) {
++            this.success = success;
++            this.cancelled = cancelled;
++            this.deleted = deleted;
++            this.error = error;
++        }
++    }
++
++    public static boolean available(TLRPC.Chat chat) {
++        return chat != null && !ChatObject.isChannelAndNotMegaGroup(chat)
++                && !ChatObject.isMonoForum(chat) && !ChatObject.isNotInChat(chat);
++    }
++
++    public static boolean isOwn(TLRPC.Message message, long dialogId, long userId) {
++        return userId != 0 && message instanceof TLRPC.TL_message && message.id > 0
++                && message.action == null && message.from_id != null && message.from_id.user_id == userId
++                && MessageObject.getDialogId(message) == dialogId;
++    }
++
++    public static boolean start(int account, long chatId, Utilities.Callback<Integer> progress,
++                                Utilities.Callback<Result> done) {
++        MessagesController controller = MessagesController.getInstance(account);
++        TLRPC.Chat chat = controller.getChat(chatId);
++        long userId = UserConfig.getInstance(account).getClientUserId();
++        if (active.containsKey(account) || userId == 0 || !available(chat) || controller.isFrozen()) return false;
++        Job job = new Job(account, userId, chatId, progress, done);
++        active.put(account, job);
++        job.nextDialog();
++        return true;
++    }
++
++    public static void cancel(int account) {
++        AndroidUtilities.runOnUIThread(() -> {
++            Job job = active.get(account);
++            if (job == null) return;
++            job.stopping = true;
++            // An already submitted delete may have succeeded: wait for its acknowledgement,
++            // update local state and stop before the next batch. Do not retry it automatically.
++            if (!job.deleting) {
++                if (job.requestId != 0) org.telegram.tgnet.ConnectionsManager.getInstance(account).cancelRequest(job.requestId, true);
++                job.finish(false, true, "");
++            }
++        });
++    }
++
++    /** Account logout/reset must detach immediately even if a delete callback never arrives. */
++    public static void cleanup(int account) {
++        AndroidUtilities.runOnUIThread(() -> {
++            Job job = active.get(account);
++            if (job == null) return;
++            if (job.requestId != 0) org.telegram.tgnet.ConnectionsManager.getInstance(account).cancelRequest(job.requestId, true);
++            job.finish(false, true, "ACCOUNT_CHANGED");
++        });
++    }
++
++    private static final class Job {
++        final int account;
++        final long userId;
++        final ArrayList<Long> dialogs = new ArrayList<>();
++        final Utilities.Callback<Integer> progress;
++        final Utilities.Callback<Result> done;
++        final int cutoffDate;
++        int dialogIndex = -1, offset, requestId, deleted;
++        long dialogId, cachedCeiling;
++        boolean finished, stopping, deleting;
++
++        Job(int account, long userId, long chatId, Utilities.Callback<Integer> progress, Utilities.Callback<Result> done) {
++            this.account = account;
++            this.userId = userId;
++            this.progress = progress;
++            this.done = done;
++            cutoffDate = org.telegram.tgnet.ConnectionsManager.getInstance(account).getCurrentTime();
++            dialogs.add(-chatId);
++            TLRPC.ChatFull full = MessagesController.getInstance(account).getChatFull(chatId);
++            if (full != null && full.migrated_from_chat_id > 0 && full.migrated_from_chat_id != chatId)
++                dialogs.add(-full.migrated_from_chat_id);
++        }
++
++        boolean valid() {
++            return !finished && UserConfig.getInstance(account).getClientUserId() == userId;
++        }
++
++        void nextDialog() {
++            if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++            if (stopping) { finish(false, true, ""); return; }
++            if (++dialogIndex == dialogs.size()) { finish(true, false, ""); return; }
++            dialogId = dialogs.get(dialogIndex);
++            offset = 0;
++            // Snapshot the local ID ceiling before search. Newly sent messages are not swept later.
++            MessagesStorage storage = MessagesStorage.getInstance(account);
++            storage.getStorageQueue().postRunnable(() -> {
++                long ceiling = 0;
++                String error = null;
++                SQLiteCursor cursor = null;
++                try {
++                    cursor = storage.getDatabase().queryFinalized("SELECT MAX(mid) FROM messages_v2 WHERE uid = " + dialogId + " AND mid > 0");
++                    if (cursor.next()) ceiling = cursor.longValue(0);
++                } catch (Exception e) { error = "CACHE_READ_FAILED"; }
++                finally { if (cursor != null) cursor.dispose(); }
++                final long value = ceiling;
++                final String failure = error;
++                AndroidUtilities.runOnUIThread(() -> {
++                    if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++                    if (failure != null) { finish(false, false, failure); return; }
++                    cachedCeiling = value;
++                    search();
++                });
++            });
++        }
++
++        void search() {
++            if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++            if (stopping) { finish(false, true, ""); return; }
++            TLRPC.TL_messages_search req = new TLRPC.TL_messages_search();
++            if (dialogIndex > 0) {
++                TLRPC.TL_inputPeerChat legacy = new TLRPC.TL_inputPeerChat();
++                legacy.chat_id = -dialogId;
++                req.peer = legacy;
++            } else req.peer = MessagesController.getInstance(account).getInputPeer(dialogId);
++            if (req.peer == null || req.peer instanceof TLRPC.TL_inputPeerEmpty) { finish(false, false, "PEER_UNAVAILABLE"); return; }
++            req.from_id = new TLRPC.TL_inputPeerSelf();
++            req.q = "";
++            req.filter = new TLRPC.TL_inputMessagesFilterEmpty();
++            req.limit = PAGE_SIZE;
++            req.offset_id = offset;
++            req.max_date = cutoffDate + 1;
++            // No top_msg_id: this command covers the whole group, including all topics.
++            requestId = org.telegram.tgnet.ConnectionsManager.getInstance(account).sendRequest(req, (response, error) -> {
++                AndroidUtilities.runOnUIThread(() -> {
++                    requestId = 0;
++                    if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++                    if (stopping) { finish(false, true, ""); return; }
++                    if (error != null || !(response instanceof TLRPC.messages_Messages)) {
++                        finish(false, false, code(error)); return;
++                    }
++                    TLRPC.messages_Messages result = (TLRPC.messages_Messages) response;
++                    if (result.messages.isEmpty()) { sweepCache(cachedCeiling + 1); return; }
++                    int oldest = Integer.MAX_VALUE;
++                    LinkedHashSet<Integer> ids = new LinkedHashSet<>();
++                    for (TLRPC.Message message : result.messages) {
++                        if (message == null || message.id <= 0 || offset != 0 && message.id >= offset) continue;
++                        oldest = Math.min(oldest, message.id);
++                        if (isOwn(message, dialogId, userId) && message.date <= cutoffDate) ids.add(message.id);
++                    }
++                    if (oldest == Integer.MAX_VALUE) { finish(false, false, "SEARCH_DID_NOT_ADVANCE"); return; }
++                    if (ids.size() > PAGE_SIZE) { finish(false, false, "SEARCH_PAGE_TOO_LARGE"); return; }
++                    offset = oldest;
++                    if (ids.isEmpty()) queueSearch();
++                    else delete(new ArrayList<>(ids));
++                });
++            });
++        }
++
++        void queueSearch() {
++            AndroidUtilities.runOnUIThread(this::search, 350);
++        }
++
++        void delete(ArrayList<Integer> ids) {
++            if (!valid() || stopping) { finish(false, true, ""); return; }
++            MessagesController controller = MessagesController.getInstance(account);
++            TLRPC.Chat chat = controller.getChat(-dialogId);
++            final boolean channel = dialogIndex == 0 && ChatObject.isChannel(chat);
++            final long scope = dialogId;
++            TLObject req;
++            if (channel) {
++                TLRPC.TL_channels_deleteMessages deletion = new TLRPC.TL_channels_deleteMessages();
++                deletion.channel = controller.getInputChannel(-dialogId);
++                if (deletion.channel == null) { finish(false, false, "PEER_UNAVAILABLE"); return; }
++                deletion.id = ids;
++                req = deletion;
++            } else {
++                TLRPC.TL_messages_deleteMessages deletion = new TLRPC.TL_messages_deleteMessages();
++                deletion.revoke = true;
++                deletion.id = ids;
++                req = deletion;
++            }
++            deleting = true;
++            requestId = org.telegram.tgnet.ConnectionsManager.getInstance(account).sendRequest(req, (response, error) -> {
++                AndroidUtilities.runOnUIThread(() -> {
++                    requestId = 0;
++                    deleting = false;
++                    if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++                    if (error != null || !(response instanceof TLRPC.TL_messages_affectedMessages)) {
++                        finish(false, stopping, code(error)); return;
++                    }
++                    TLRPC.TL_messages_affectedMessages affected = (TLRPC.TL_messages_affectedMessages) response;
++                    Utilities.stageQueue.postRunnable(() -> {
++                        if (UserConfig.getInstance(account).getClientUserId() != userId) return;
++                        if (channel) controller.processNewChannelDifferenceParams(affected.pts, affected.pts_count, -scope);
++                        else controller.processNewDifferenceParams(-1, affected.pts, -1, affected.pts_count);
++                    });
++                    // cacheOnly prevents a second request; explicit deletion clears retention/history too.
++                    controller.deleteMessages(ids, null, null, scope, 0, true, 0, true);
++                    deleted += ids.size();
++                    if (progress != null) progress.run(deleted);
++                    if (stopping) finish(false, true, "");
++                    else queueSearch();
++                });
++            });
++        }
++
++        void sweepCache(long beforeId) {
++            if (!valid() || stopping) { finish(false, true, ""); return; }
++            if (cachedCeiling == 0 || beforeId <= 0) { nextDialog(); return; }
++            MessagesStorage storage = MessagesStorage.getInstance(account);
++            final long scope = dialogId;
++            storage.getStorageQueue().postRunnable(() -> {
++                ArrayList<Integer> ids = new ArrayList<>();
++                long next = beforeId;
++                int rows = 0;
++                String error = null;
++                SQLiteCursor cursor = null;
++                try {
++                    cursor = storage.getDatabase().queryFinalized("SELECT mid, data FROM messages_v2 WHERE uid = " + scope
++                            + " AND mid > 0 AND mid < " + beforeId + " ORDER BY mid DESC LIMIT " + PAGE_SIZE);
++                    while (cursor.next()) {
++                        int id = cursor.intValue(0);
++                        next = Math.min(next, id);
++                        rows++;
++                        NativeByteBuffer data = cursor.byteBufferValue(1);
++                        if (data == null) continue;
++                        try {
++                            TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
++                            if (message != null) {
++                                message.id = id;
++                                message.dialog_id = scope;
++                                if (isOwn(message, scope, userId) && message.date <= cutoffDate) ids.add(id);
++                            }
++                        } finally { data.reuse(); }
++                    }
++                } catch (Exception e) { error = "CACHE_READ_FAILED"; }
++                finally { if (cursor != null) cursor.dispose(); }
++                final long nextId = next;
++                final boolean more = rows == PAGE_SIZE;
++                final String failure = error;
++                AndroidUtilities.runOnUIThread(() -> {
++                    if (!valid()) { finish(false, true, "ACCOUNT_CHANGED"); return; }
++                    if (stopping) { finish(false, true, ""); return; }
++                    if (failure != null) { finish(false, false, failure); return; }
++                    if (!ids.isEmpty()) {
++                        MessagesController.getInstance(account).deleteMessages(ids, null, null, scope, 0, true, 0, true);
++                        deleted += ids.size();
++                        if (progress != null) progress.run(deleted);
++                    }
++                    if (more && nextId < beforeId) sweepCache(nextId);
++                    else nextDialog();
++                });
++            });
++        }
++
++        String code(TLRPC.TL_error error) {
++            return error != null && error.text != null && error.text.matches("[A-Z0-9_]{1,80}") ? error.text : "REQUEST_FAILED";
++        }
++
++        void finish(boolean success, boolean cancelled, String error) {
++            if (finished) return;
++            finished = true;
++            active.remove(account);
++            if (done != null) done.run(new Result(success, cancelled, deleted, error));
++        }
++    }
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java b/TMessagesProj/src/main/java/org/telegram/messenger/ExpiringMediaRetention.java
 new file mode 100644
 index 00000000..891a865c
@@ -530,19 +819,20 @@ index 373e4235..fd022d53 100644
          replyMessageObject = replyToMessage;
          eventId = eid;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
-index 9d0077ff..af07a883 100644
+index 9d0077ff..b1751708 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
-@@ -6423,6 +6423,8 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -6423,6 +6423,9 @@ public class MessagesController extends BaseController implements NotificationCe
      }
  
      public void cleanup() {
++        DeleteOwnGroupMessages.cleanup(currentAccount);
 +        ProtectedMessageForwarder.cancel(currentAccount);
 +        RetainedMessages.clear(currentAccount);
          getContactsController().cleanup();
          MediaController.getInstance().cleanup();
          getNotificationsController().cleanup();
-@@ -9370,6 +9372,10 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -9370,6 +9373,10 @@ public class MessagesController extends BaseController implements NotificationCe
                      }
                  }
              }
@@ -553,7 +843,7 @@ index 9d0077ff..af07a883 100644
              if (scheduled) {
                  getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, false, ChatActivity.MODE_SCHEDULED, 0);
              } else if (quickReplies) {
-@@ -14511,6 +14517,71 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -14511,6 +14518,71 @@ public class MessagesController extends BaseController implements NotificationCe
          getMessagesStorage().emptyMessagesMedia(dialogId, mids);
      }
  
@@ -625,7 +915,7 @@ index 9d0077ff..af07a883 100644
      public void markMessageAsRead2(long dialogId, int mid, TLRPC.InputChannel inputChannel, int ttl, long taskId) {
          markMessageAsRead2(dialogId, mid, inputChannel, ttl, taskId, true);
      }
-@@ -17634,35 +17705,11 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -17634,35 +17706,11 @@ public class MessagesController extends BaseController implements NotificationCe
      }
  
      protected void deleteMessagesByPush(long dialogId, ArrayList<Integer> ids, long channelId) {
@@ -666,7 +956,7 @@ index 9d0077ff..af07a883 100644
          });
      }
  
-@@ -18894,15 +18941,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -18894,15 +18942,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  dialogs_read_outbox_max.put(dialogId, Math.max(value, update.max_id));
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteMessages) {
                  TL_update.TL_updateDeleteMessages update = (TL_update.TL_updateDeleteMessages) baseUpdate;
@@ -683,7 +973,7 @@ index 9d0077ff..af07a883 100644
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteQuickReplyMessages) {
                  TL_update.TL_updateDeleteQuickReplyMessages update = (TL_update.TL_updateDeleteQuickReplyMessages) baseUpdate;
                  if (deletedQuickReplyMessages == null) {
-@@ -19420,19 +19459,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19420,19 +19460,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  dialogs_read_outbox_max.put(dialogId, Math.max(value, update.max_id));
              } else if (baseUpdate instanceof TL_update.TL_updateDeleteChannelMessages) {
                  TL_update.TL_updateDeleteChannelMessages update = (TL_update.TL_updateDeleteChannelMessages) baseUpdate;
@@ -704,7 +994,7 @@ index 9d0077ff..af07a883 100644
              } else if (baseUpdate instanceof TL_update.TL_updateChannel) {
                  if (BuildVars.LOGS_ENABLED) {
                      TL_update.TL_updateChannel update = (TL_update.TL_updateChannel) baseUpdate;
-@@ -19625,14 +19652,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19625,14 +19653,7 @@ public class MessagesController extends BaseController implements NotificationCe
                  AndroidUtilities.runOnUIThread(() -> LocaleController.getInstance().reloadCurrentRemoteLocale(currentAccount, update.lang_code, false, null));
              } else if (baseUpdate instanceof TL_update.TL_updateChannelAvailableMessages) {
                  TL_update.TL_updateChannelAvailableMessages update = (TL_update.TL_updateChannelAvailableMessages) baseUpdate;
@@ -720,7 +1010,7 @@ index 9d0077ff..af07a883 100644
              } else if (baseUpdate instanceof TL_update.TL_updateMessagePoll) {
                  TL_update.TL_updateMessagePoll update = (TL_update.TL_updateMessagePoll) baseUpdate;
                  if (update.peer != null && update.results != null && update.msg_id != 0) {
-@@ -21724,101 +21744,8 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -21724,101 +21745,8 @@ public class MessagesController extends BaseController implements NotificationCe
      }
  
      public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {
@@ -2108,7 +2398,7 @@ index 4f0508f1..d42c2572 100644
              return;
          }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index 1ed161bf..db77db6a 100644
+index 1ed161bf..fdcb354b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 @@ -1240,6 +1240,8 @@ public class ChatActivity extends BaseFragment implements
@@ -2120,7 +2410,15 @@ index 1ed161bf..db77db6a 100644
      public final static int OPTION_RETRY = 0;
      public final static int OPTION_DELETE = 1;
      public final static int OPTION_FORWARD = 2;
-@@ -2642,6 +2644,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -1677,6 +1679,7 @@ public class ChatActivity extends BaseFragment implements
+     private final static int chat_menu_attach = 14;
+     private final static int chat_menu_search = -1;
+     private final static int chat_menu_options = -2;
++    private final static int delete_all_from_me = 10003;
+     private final static int clear_history = 15;
+     private final static int delete_chat = 16;
+     private final static int share_contact = 17;
+@@ -2642,6 +2645,7 @@ public class ChatActivity extends BaseFragment implements
  
      @Override
      public boolean onFragmentCreate() {
@@ -2128,7 +2426,7 @@ index 1ed161bf..db77db6a 100644
          final long chatId = arguments.getLong("chat_id", 0);
          final long userId = arguments.getLong("user_id", 0);
          final int encId = arguments.getInt("enc_id", 0);
-@@ -2900,6 +2903,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -2900,6 +2904,7 @@ public class ChatActivity extends BaseFragment implements
              .add(NotificationCenter.userIsPremiumBlockedUpadted)
              .add(NotificationCenter.didLoadSendAsPeers)
              .add(NotificationCenter.closeChatActivity)
@@ -2136,7 +2434,26 @@ index 1ed161bf..db77db6a 100644
              .add(NotificationCenter.messagesDeleted)
              .add(NotificationCenter.historyCleared)
              .add(NotificationCenter.messageReceivedByServer)
-@@ -12735,46 +12739,77 @@ public class ChatActivity extends BaseFragment implements
+@@ -3842,6 +3847,8 @@ public class ChatActivity extends BaseFragment implements
+                         return;
+                     }
+                     showDialog(AlertsCreator.createTTLAlert(getParentActivity(), currentEncryptedChat, themeDelegate).create());
++                } else if (id == delete_all_from_me) {
++                    showDeleteOwnGroupMessagesConfirmation();
+                 } else if (id == clear_history || id == delete_chat || id == auto_delete_timer) {
+                     if (getParentActivity() == null) {
+                         return;
+@@ -4419,6 +4426,9 @@ public class ChatActivity extends BaseFragment implements
+                 clearHistoryItem = headerItem.lazilyAddSubItem(clear_history, R.drawable.msg_clear,
+                     LocaleController.getString(UserObject.isBotForum(currentUser) ? R.string.ClearAllHistory : R.string.ClearHistory));
+             }
++            if (chatMode == MODE_DEFAULT && org.telegram.messenger.DeleteOwnGroupMessages.available(currentChat)) {
++                headerItem.lazilyAddSubItem(delete_all_from_me, R.drawable.msg_delete, LocaleController.getString(R.string.DeleteAllMessagesFromMe));
++            }
+             boolean addedSettings = false;
+             if (!isTopic) {
+                 if (ChatObject.isChannel(currentChat) && !currentChat.creator) {
+@@ -12735,46 +12745,81 @@ public class ChatActivity extends BaseFragment implements
          updateSelectedMessageReactions();
      }
  
@@ -2154,6 +2471,10 @@ index 1ed161bf..db77db6a 100644
 -                }
 -            } else {
 -                str = LocaleController.getString(R.string.ForwardsRestrictedInfoBot);
++    private void showDeleteOwnGroupMessagesConfirmation() {
++        if (chatMode == MODE_DEFAULT) org.telegram.ui.Components.DeleteOwnGroupMessagesDialog.show(this, currentChat);
++    }
++
 +    private void openProtectedForward(ArrayList<MessageObject> sources) {
 +        final int account = currentAccount;
 +        final long sourceUserId = getUserConfig().getClientUserId();
@@ -2249,7 +2570,7 @@ index 1ed161bf..db77db6a 100644
              return;
          }
          int hasPoll = 0;
-@@ -19878,7 +19913,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -19878,7 +19923,7 @@ public class ChatActivity extends BaseFragment implements
                          cantDeleteMessagesCount--;
                      }
                      boolean noforwards = isPeerNoForwards();
@@ -2258,7 +2579,7 @@ index 1ed161bf..db77db6a 100644
                          cantForwardMessagesCount--;
                      } else {
                          canForwardMessagesCount--;
-@@ -19915,7 +19950,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -19915,7 +19960,7 @@ public class ChatActivity extends BaseFragment implements
                          cantDeleteMessagesCount++;
                      }
                      boolean noforwards = isPeerNoForwards();
@@ -2267,7 +2588,7 @@ index 1ed161bf..db77db6a 100644
                          cantForwardMessagesCount++;
                      } else {
                          canForwardMessagesCount++;
-@@ -23091,6 +23126,18 @@ public class ChatActivity extends BaseFragment implements
+@@ -23091,6 +23136,18 @@ public class ChatActivity extends BaseFragment implements
              if (updated && chatAdapter != null) {
                  chatAdapter.notifyDataSetChanged(false);
              }
@@ -2286,7 +2607,7 @@ index 1ed161bf..db77db6a 100644
          } else if (id == NotificationCenter.messagesDeleted) {
              boolean scheduled = (Boolean) args[2];
              if (scheduled != (chatMode == MODE_SCHEDULED)) {
-@@ -25759,55 +25806,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -25759,55 +25816,13 @@ public class ChatActivity extends BaseFragment implements
      private Pattern sponsoredUrlPattern;
      private MessageObject botSponsoredMessage;
      private void addSponsoredMessages(boolean animated) {
@@ -2348,7 +2669,7 @@ index 1ed161bf..db77db6a 100644
          }
      }
  
-@@ -31869,6 +31874,25 @@ public class ChatActivity extends BaseFragment implements
+@@ -31869,6 +31884,25 @@ public class ChatActivity extends BaseFragment implements
                  fillMessageMenu(primaryMessage, icons, items, options);
              }
  
@@ -2374,7 +2695,7 @@ index 1ed161bf..db77db6a 100644
              if (selectedObject != null && selectedObject.isHiddenSensitive() && !selectedObject.isMediaSpoilersRevealed) {
                  for (int i = 0; i < options.size(); ++i) {
                      final int option = options.get(i);
-@@ -34243,6 +34267,22 @@ public class ChatActivity extends BaseFragment implements
+@@ -34243,6 +34277,22 @@ public class ChatActivity extends BaseFragment implements
          }
          boolean preserveDim = false;
          switch (option) {
@@ -2397,7 +2718,7 @@ index 1ed161bf..db77db6a 100644
              case OPTION_RETRY: {
                  final MessageObject object = selectedObject;
                  final MessageObject.GroupedMessages group = selectedObjectGroup;
-@@ -34280,6 +34320,13 @@ public class ChatActivity extends BaseFragment implements
+@@ -34280,6 +34330,13 @@ public class ChatActivity extends BaseFragment implements
                  break;
              }
              case OPTION_FORWARD: {
@@ -2411,7 +2732,7 @@ index 1ed161bf..db77db6a 100644
                  if (getMessagesController().isFrozen()) {
                      AccountFrozenAlert.show(currentAccount);
                      selectedObject = null;
-@@ -46850,7 +46897,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46850,7 +46907,7 @@ public class ChatActivity extends BaseFragment implements
                      && (!selectedObject.needDrawBluredPreview() || selectedObject.hasExtendedMediaPreview())
                      && !selectedObject.isLiveLocation()
                      && selectedObject.type != MessageObject.TYPE_PHONE_CALL
@@ -2483,6 +2804,74 @@ index fa2d7e00..2422b2c8 100644
          int mode = SharedConfig.repeatMode;
          if (mode == 0 || mode == 1) {
              if (SharedConfig.shuffleMusic) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteOwnGroupMessagesDialog.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteOwnGroupMessagesDialog.java
+new file mode 100644
+index 00000000..48539340
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteOwnGroupMessagesDialog.java
+@@ -0,0 +1,62 @@
++package org.telegram.ui.Components;
++
++import org.telegram.messenger.ApplicationLoader;
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.R;
++import org.telegram.messenger.UserConfig;
++import org.telegram.tgnet.TLRPC;
++import org.telegram.ui.ActionBar.AlertDialog;
++import org.telegram.ui.ActionBar.BaseFragment;
++
++import java.lang.ref.WeakReference;
++
++public final class DeleteOwnGroupMessagesDialog {
++    private DeleteOwnGroupMessagesDialog() {}
++
++    public static void show(BaseFragment fragment, TLRPC.Chat chat) {
++        if (fragment.isFinished || fragment.getParentActivity() == null || !org.telegram.messenger.DeleteOwnGroupMessages.available(chat)) return;
++        final int account = fragment.getCurrentAccount();
++        final long userId = UserConfig.getInstance(fragment.getCurrentAccount()).getClientUserId();
++        final long chatId = chat.id;
++        AlertDialog.Builder confirm = new AlertDialog.Builder(fragment.getParentActivity(), fragment.getResourceProvider());
++        confirm.setTitle(LocaleController.getString(R.string.DeleteAllMessagesFromMe));
++        confirm.setMessage(LocaleController.getString(R.string.DeleteAllMessagesFromMeConfirm));
++        confirm.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
++        confirm.setPositiveButton(LocaleController.getString(R.string.Delete), (dialog, which) -> {
++            if (fragment.isFinished || fragment.getParentActivity() == null || fragment.getCurrentAccount() != account
++                    || UserConfig.getInstance(fragment.getCurrentAccount()).getClientUserId() != userId) return;
++            AlertDialog.Builder progressBuilder = new AlertDialog.Builder(fragment.getParentActivity(), fragment.getResourceProvider());
++            progressBuilder.setTitle(LocaleController.getString(R.string.DeleteAllMessagesFromMe));
++            progressBuilder.setMessage(LocaleController.formatString(R.string.DeleteOwnMessagesProgress, 0));
++            progressBuilder.setNegativeButton(LocaleController.getString(R.string.Stop),
++                    (d, w) -> org.telegram.messenger.DeleteOwnGroupMessages.cancel(account));
++            final AlertDialog progress = progressBuilder.create();
++            progress.setCanceledOnTouchOutside(false);
++            progress.setOnCancelListener(d -> org.telegram.messenger.DeleteOwnGroupMessages.cancel(account));
++            // Do not begin a destructive operation if its progress/Stop UI cannot be attached.
++            if (fragment.showDialog(progress) == null) return;
++            // BaseFragment.showDialog enables outside-touch cancellation; restore our choice afterward.
++            progress.setCanceledOnTouchOutside(false);
++            final WeakReference<AlertDialog> dialogRef = new WeakReference<>(progress);
++            boolean started = org.telegram.messenger.DeleteOwnGroupMessages.start(account, chatId, count -> {
++                AlertDialog target = dialogRef.get();
++                if (target != null && target.isShowing()) target.setMessage(LocaleController.formatString(R.string.DeleteOwnMessagesProgress, count));
++            }, result -> {
++                AlertDialog target = dialogRef.get();
++                if (target != null && target.isShowing()) target.dismiss();
++                if (UserConfig.getInstance(account).getClientUserId() != userId) return;
++                String text = result.success ? LocaleController.formatString(R.string.DeleteOwnMessagesDone, result.deleted)
++                        : LocaleController.formatString(R.string.DeleteOwnMessagesStopped, result.deleted,
++                                result.cancelled ? LocaleController.getString(R.string.DeleteOwnMessagesCancelled) : result.error);
++                android.widget.Toast.makeText(ApplicationLoader.applicationContext, text, android.widget.Toast.LENGTH_LONG).show();
++            });
++            if (!started) {
++                progress.dismiss();
++                android.widget.Toast.makeText(ApplicationLoader.applicationContext,
++                        LocaleController.getString(R.string.DeleteOwnMessagesBusy), android.widget.Toast.LENGTH_LONG).show();
++            }
++        });
++        fragment.showDialog(confirm.create());
++    }
++
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java
 index 81cc95c8..b8706295 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/JoinGroupAlert.java
@@ -2723,6 +3112,38 @@ index 1e4ad20e..19bae493 100644
              }
              currentMessageObject = newMessageObject;
              if (newMessageObject != null) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/TopicsFragment.java b/TMessagesProj/src/main/java/org/telegram/ui/TopicsFragment.java
+index f6c034ac..8b790705 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/TopicsFragment.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/TopicsFragment.java
+@@ -203,6 +203,7 @@ public class TopicsFragment extends BaseFragment implements NotificationCenter.N
+     private static final int show_id = 13;
+     private static final int boost_group_id = 14;
+     private static final int report = 15;
++    private static final int delete_all_from_me = 10003;
+ 
+     private boolean removeFragmentOnTransitionEnd;
+     private boolean finishDialogRightSlidingPreviewOnTransitionEnd;
+@@ -649,6 +650,9 @@ public class TopicsFragment extends BaseFragment implements NotificationCenter.N
+                 }
+                 TLRPC.TL_forumTopic topic;
+                 switch (id) {
++                    case delete_all_from_me:
++                        org.telegram.ui.Components.DeleteOwnGroupMessagesDialog.show(TopicsFragment.this, getCurrentChat());
++                        break;
+                     case toggle_id:
+                         getMessagesController().getTopicsController().toggleViewForumAsMessages(chatId, true);
+                         finishDialogRightSlidingPreviewOnTransitionEnd = true;
+@@ -869,6 +873,9 @@ public class TopicsFragment extends BaseFragment implements NotificationCenter.N
+         other = menu.addItem(0, R.drawable.ic_ab_other, themeDelegate);
+         other.setContentDescription(getString(R.string.AccDescrMoreOptions));
+         other.addSubItem(toggle_id, R.drawable.msg_discussion, getString(R.string.TopicViewAsMessages));
++        if (org.telegram.messenger.DeleteOwnGroupMessages.available(getCurrentChat())) {
++            other.addSubItem(delete_all_from_me, R.drawable.msg_delete, getString(R.string.DeleteAllMessagesFromMe));
++        }
+         addMemberSubMenu = other.addSubItem(add_member_id, R.drawable.msg_addcontact, getString(R.string.AddMember));
+         boostGroupSubmenu = other.addSubItem(boost_group_id, 0, new RLottieDrawable(R.raw.boosts, AndroidUtilities.dp(24), AndroidUtilities.dp(24)), getString(R.string.BoostingBoostGroupMenu), true, false);
+         createTopicSubmenu = other.addSubItem(create_topic_id, R.drawable.msg_topic_create, getString(R.string.CreateTopic));
 diff --git a/TMessagesProj/src/main/res/drawable-nodpi/echogram_launcher_foreground.png b/TMessagesProj/src/main/res/drawable-nodpi/echogram_launcher_foreground.png
 new file mode 100644
 index 0000000000000000000000000000000000000000..a3e7b48e8d1fcfe64e08a029053e8fbf29d2573c
@@ -10186,7 +10607,7 @@ index d4683443..05ea3f9e 100644
      <string name="English">Англійська</string>
      <string name="LanguageNameInEnglish">Ukrainian</string>
 diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
-index 9f56ca61..a3a24f88 100644
+index 9f56ca61..9659e7fd 100644
 --- a/TMessagesProj/src/main/res/values/strings.xml
 +++ b/TMessagesProj/src/main/res/values/strings.xml
 @@ -1,7 +1,7 @@
@@ -10199,7 +10620,7 @@ index 9f56ca61..a3a24f88 100644
      <string name="LanguageName">English</string>
      <string name="English">English</string>
      <string name="LanguageNameInEnglish">English</string>
-@@ -11678,4 +11678,20 @@
+@@ -11678,4 +11678,27 @@
      <string name="FpnvConsentCountry">Country</string>
      <string name="FpnvConsentMccMnc">MCC / MNC</string>
      <string name="FpnvConsentPhoneNumber">Phone Number</string>
@@ -10219,6 +10640,13 @@ index 9f56ca61..a3a24f88 100644
 +    <string name="ProtectedForwardUnavailable" translatable="false">Cannot copy these messages to this chat, or another transfer is still running.</string>
 +    <string name="ProtectedForwardNoComment" translatable="false">Send the comment separately when forwarding protected messages.</string>
 +    <string name="ProtectedForwardSingleChat" translatable="false">Choose one destination chat.</string>
++    <string name="DeleteAllMessagesFromMe" translatable="false">Delete all messages from me</string>
++    <string name="DeleteAllMessagesFromMeConfirm" translatable="false">Permanently delete messages, photos, videos and files sent by your personal account in this entire group, including all topics and earlier migrated history? This requests deletion for everyone and also removes your locally retained copies and edit history. This cannot be undone. Messages sent anonymously or as a channel cannot be identified as yours. Telegram may restrict deletion of some messages.</string>
++    <string name="DeleteOwnMessagesProgress" translatable="false">Deleting your messages… Deleted: %1$d. Stopping prevents further deletions. Messages already being deleted may still disappear.</string>
++    <string name="DeleteOwnMessagesDone" translatable="false">Deleted %1$d of your messages.</string>
++    <string name="DeleteOwnMessagesStopped" translatable="false">Stopped after deleting %1$d messages: %2$s. Some deletions may already have completed.</string>
++    <string name="DeleteOwnMessagesBusy" translatable="false">Another deletion is running, or this group is unavailable.</string>
++    <string name="DeleteOwnMessagesCancelled" translatable="false">Cancelled</string>
  </resources>
 diff --git a/TMessagesProj_App/build.gradle b/TMessagesProj_App/build.gradle
 index c581f3de..d80b38e8 100644
@@ -10254,7 +10682,7 @@ index c581f3de..d80b38e8 100644
              sourceSets.debug {
                  manifest.srcFile '../TMessagesProj/config/debug/AndroidManifest_SDK23.xml'
 diff --git a/gradle.properties b/gradle.properties
-index 574e3b80..73ebc842 100644
+index 574e3b80..acd53bb9 100644
 --- a/gradle.properties
 +++ b/gradle.properties
 @@ -13,7 +13,7 @@
@@ -10262,7 +10690,7 @@ index 574e3b80..73ebc842 100644
  # org.gradle.parallel=true
  #Sat Mar 12 05:53:50 MSK 2016
 -APP_VERSION_CODE=7291
-+APP_VERSION_CODE=7299
++APP_VERSION_CODE=7300
  APP_VERSION_NAME=13.2.1
  APP_PACKAGE=org.telegram.messenger
  IS_PRIVATE=false

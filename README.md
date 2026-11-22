@@ -1,6 +1,6 @@
 # EchoGram — unofficial Telegram Android build
 
-Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7299**.
+Based on Telegram Android **13.2.1**, upstream commit `7be672ead283d022812d75c729d3a04dd4c2a2c6`, custom build **7300**.
 
 Current changes:
 - EchoGram name and the supplied blue/purple icon, including adaptive launcher resources.
@@ -10,9 +10,9 @@ Current changes:
 - Show precise message and available last-seen timestamps in 24-hour HH:mm:ss format; hidden status remains hidden.
 - Read retention markers from an in-memory index, load/persist them on the storage queue, batch redraw notifications and preserve retained rows during channel synchronization.
 
-Build workflow runs on `build/echogram-13.2.1-7299` or by workflow_dispatch.
+Build workflow runs on `build/echogram-13.2.1-7300` or by workflow_dispatch.
 The existing six Actions secrets supply Telegram API credentials and the signing keystore.
-After a successful run, download **EchoGram-13.2.1-7299-APK**, then extract **EchoGram-13.2.1.apk**.
+After a successful run, download **EchoGram-13.2.1-7300-APK**, then extract **EchoGram-13.2.1.apk**.
 The existing package/signing setup is retained for update compatibility; the version code is increased.
 
 Local checks cover retention, account isolation, storage-queue ordering, rendering, audio controls, timestamps and launcher resources. Device performance and Android integration still require installing and testing the built APK.
@@ -52,3 +52,15 @@ Validation for 7298: reproduced the real AndroidUtilities internal-path policy w
 Build 7299 fixes expired file-reference refresh for the raw TLRPC.Message snapshots used by private forwarding downloads. FileRefController recognized such parents for keys but requestReferenceFromServer lacked their dispatch branch, resulting in reason 0 when a refresh was needed. Fetch the original message through the account controller: channels.getMessages for supergroups/channels, messages.getMessages otherwise; reuse normal reference replacement/resume logic. Nonpositive IDs and secret messages remain excluded. No read/open receipts or normal source-cache writes are added. The downloader exposes only bounded machine error codes to forwarding diagnostics, to distinguish future server failures from generic REASON_0. This defect is reproduced in code; the specific user's group still requires testing with the new APK.
 
 7299 validation: 13 extracted actual refresh-dispatch checks, 6 real download error-code sanitization checks, 67 forwarding lifecycle/upload checks, 9 downloader cancellation checks and Java syntax checks passed. The preceding 7298 GitHub build completed successfully.
+
+Pending local source change — no APK build or GitHub workflow started: group and forum-topic-list overflow menus expose **Delete all messages from me**, behind a shared explicit permanent-deletion confirmation. Search only the authenticated personal account, across the entire group/all topics and available migrated basic-group history, with 100-message descending-ID pages and a start-time cutoff. Re-check message author and dialog scope before sending deletes. Use revoke=true in basic groups and channel-scoped deletion in supergroups; wait for server acknowledgement before the existing cacheOnly explicit-deletion path clears local rows, retained markers and edit history. Scan cached rows in 100-row storage-queue pages afterward to remove locally retained own copies already absent on the server, preserving a pre-search cache ID ceiling.
+
+Progress shows confirmed deletion count with Stop; stopping an in-flight deletion waits for its acknowledgement and prevents later batches. Account identity changes, server errors, nonadvancing/oversized pages and local read failures stop the job; partial completion is reported rather than claimed as success. Anonymous/channel-identity posts cannot safely be attributed to an individual and are excluded. Service/pending/newly sent messages and other authors/dialogs are not deleted. Telegram may reject deletion of older or otherwise restricted messages. No actual user messages were deleted during development.
+
+Local validation: 44 tests of the actual helper with transport/database stubs, 11 tests of the actual shared confirmation, all referenced resources and modified Java syntax; real SQLite keyset paging/cutoff/isolation checks. Previous retention and edit-history suites rechecked. Full Android compilation/device validation remains pending. The app version/package/signing and workflow are unchanged; these additions are not in the already published 7299 APK.
+
+Follow-up stability review of the pending own-message deletion: logout/reset now forcibly detaches an in-flight job even if the old network callback never returns, while the user's Stop action still waits for the submitted delete acknowledgement. Late old-job callbacks cannot clear a new job or modify the new account. Progress callbacks retain only a weak dialog reference; refuse to start if the progress/Stop UI cannot attach, ignore finished fragments, and restore outside-touch cancellation settings after BaseFragment.showDialog. Tolerate null entries in search responses without touching unrelated messages.
+
+Latest validation: 52 helper and 13 shared-confirmation checks passed, including logout during deletion with no callback, delayed callbacks after a new job, closed/refused UI, outside taps, account changes and null search entries. Retention (29), history (30), forwarding (67), expiring media (49), audio (12), Burn (20), custom params (38), trash marker (14), member-count lifecycle (11), file-reference refresh (13), uploader guard (4), download cancellation (9), download error codes (6), deferred forward guards (6), rendering (8), timestamp formatting (27), real worker-thread ordering and native account-slot checks passed. 250,000 retention lookups perform no preferences reads; notifications coalesce. All 29 changed Java files pass syntax parsing, changed XML parses, and the cumulative patch applies to clean upstream. No local Android SDK/ADB/Gradle is available, so no full Android compilation or phone performance measurement was performed. No APK build, GitHub publication or user-message deletion was started during this review.
+
+Build 7300 packages the reviewed Delete all messages from me command and its logout/dialog lifecycle fixes, preserving all prior EchoGram changes. The package, signing identity and ARM32/ARM64 targets are unchanged for in-place updates.
